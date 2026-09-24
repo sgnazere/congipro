@@ -4,10 +4,13 @@
 
 const crypto = require('crypto');
 
-const MASTER_KEY = process.env.LICENSE_MASTER_KEY; // [valeur par défaut retirée avant publication]
+// Pas de valeur par défaut : sans clé, aucune licence ne peut être validée
+const MASTER_KEY = process.env.LICENSE_MASTER_KEY;
+if (!MASTER_KEY) console.error('⚠️  LICENSE_MASTER_KEY absente : toutes les licences seront refusées');
 
 // ── VÉRIFICATION SIGNATURE ───────────────────────────────────
 function verifySignature(payload, signature) {
+  if (!MASTER_KEY || typeof signature !== 'string') return false;
   const data = [
     payload.licenseCode,
     payload.clientName,

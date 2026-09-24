@@ -6,12 +6,19 @@
 require('dotenv').config({ path: require('path').join(__dirname, '../.env') });
 const { getCachedLicense, checkLicenseFromDB, validateLicenseKey, invalidateCache } = require('./license/validator');
 
+const fs        = require('fs');
+const path      = require('path');
+const crypto    = require('crypto');
 const express   = require('express');
 const cors      = require('cors');
 const helmet    = require('helmet');
 const morgan    = require('morgan');
 const rateLimit = require('express-rate-limit');
-const { Pool }  = require('pg');
+const { Pool, types } = require('pg');
+
+// DATE (oid 1082) renvoyée telle quelle ('AAAA-MM-JJ') : sans cela pg crée un Date à minuit
+// heure locale du serveur, ce qui décale les dates d'un jour hors fuseau UTC
+types.setTypeParser(1082, v => v);
 const bcrypt    = require('bcrypt');
 const jwt       = require('jsonwebtoken');
 const { z }     = require('zod');
@@ -26,6 +33,10 @@ const config = {
   jwtExpiry:     '15m',
   jwtRefreshExp: '7d',
   bcryptRounds:  12,
+  // Origines autorisées (séparées par des virgules) ; localhost toujours accepté hors production
+  corsOrigins:   (process.env.FRONTEND_URL || '').split(',').map(s => s.trim()).filter(Boolean),
+  uploadDir:     process.env.UPLOAD_DIR || path.join(__dirname, '../uploads'),
+  maxUploadBytes: 3 * 1024 * 1024,
   db: {
     host:                   process.env.DB_HOST     || 'localhost',
     port:                   parseInt(process.env.DB_PORT) || 5432,
@@ -81,17 +92,74 @@ const makeTokens = (user) => ({
 async function calcBusinessDays(start, end) {
   if (!start || !end) return 0;
   const holidays = await db.many('SELECT date FROM holidays WHERE date BETWEEN $1 AND $2', [start, end]);
-  const hSet = new Set(holidays.map(h => new Date(h.date).toISOString().slice(0, 10)));
+  const hSet = new Set(holidays.map(h => h.date));
   let count = 0;
-  const d = new Date(start);
-  const e = new Date(end);
+  // Calcul en UTC : 'AAAA-MM-JJ' est interprété à minuit UTC, getDay() local décalerait les jours
+  const d = new Date(start + 'T00:00:00Z');
+  const e = new Date(end + 'T00:00:00Z');
   while (d <= e) {
-    const dow = d.getDay();
+    const dow = d.getUTCDay();
     const ds  = d.toISOString().slice(0, 10);
     if (dow >= 1 && dow <= 5 && !hSet.has(ds)) count++;
-    d.setDate(d.getDate() + 1);
+    d.setUTCDate(d.getUTCDate() + 1);
   }
   return count;
+}
+
+// Crée le solde (user, type, année) s'il n'existe pas, à partir du plafond du type
+async function ensureBalance(userId, leaveTypeId, year) {
+  await db.run(
+    `INSERT INTO leave_balances (user_id, leave_type_id, year, total_days, used_days, pending_days)
+     SELECT $1, lt.id, $3, lt.max_days_per_year, 0, 0 FROM leave_types lt WHERE lt.id=$2
+     ON CONFLICT (user_id, leave_type_id, year) DO NOTHING`,
+    [userId, leaveTypeId, year]
+  );
+  return db.one('SELECT * FROM leave_balances WHERE user_id=$1 AND leave_type_id=$2 AND year=$3',
+    [userId, leaveTypeId, year]);
+}
+
+// Notifie tous les utilisateurs actifs des rôles donnés
+async function notifyRoles(roles, type, title, message, requestId) {
+  await db.run(
+    `INSERT INTO notifications (user_id, type, title, message, request_id)
+     SELECT id, $2, $3, $4, $5 FROM users WHERE is_active=TRUE AND role = ANY($1::user_role[])`,
+    [roles, type, title, message, requestId]
+  );
+}
+
+async function notify(userId, type, title, message, requestId) {
+  await db.run(
+    'INSERT INTO notifications (user_id, type, title, message, request_id) VALUES ($1,$2,$3,$4,$5)',
+    [userId, type, title, message, requestId]
+  );
+}
+
+// Justificatifs : PDF / JPEG / PNG, 3 Mo max, stockés hors webroot
+const DOC_TYPES = { 'application/pdf': '.pdf', 'image/jpeg': '.jpg', 'image/png': '.png' };
+
+function saveDocument(doc) {
+  const ext = DOC_TYPES[doc.type];
+  if (!ext) throw Object.assign(new Error('Format de justificatif non accepté (PDF, JPG ou PNG)'), { status: 422 });
+  const buf = Buffer.from(doc.data, 'base64');
+  if (buf.length === 0 || buf.length > config.maxUploadBytes) {
+    throw Object.assign(new Error('Justificatif vide ou trop volumineux (3 Mo maximum)'), { status: 422 });
+  }
+  fs.mkdirSync(config.uploadDir, { recursive: true });
+  const name = crypto.randomUUID() + ext;
+  fs.writeFileSync(path.join(config.uploadDir, name), buf);
+  return name;
+}
+
+// Qui peut agir sur une demande en attente ?
+//  niveau 1 : le superviseur direct du demandeur (ou un admin)
+//  niveau 2 : RH ou admin
+//  personne ne valide sa propre demande
+function canValidate(user, request, requesterManagerId) {
+  if (request.status !== 'pending' || request.user_id === user.id) return false;
+  if (user.role === 'admin') return true;
+  if (request.current_level === 1) return requesterManagerId === user.id;
+  if (request.current_level === 2) return user.role === 'rh';
+  return false;
 }
 
 // ════════════════════════════════════════════════════════════
@@ -130,12 +198,18 @@ const validate = (schema) => (req, res, next) => {
 // ════════════════════════════════════════════════════════════
 const app = express();
 
+// Derrière un reverse proxy (nginx, IIS…), nécessaire pour l'IP réelle et le rate limiting
+if (process.env.TRUST_PROXY) app.set('trust proxy', process.env.TRUST_PROXY === 'true' ? 1 : process.env.TRUST_PROXY);
+
 app.use(helmet());
 
-// CORS — accepte tous les ports localhost en développement
+// CORS — origines de FRONTEND_URL, plus localhost hors production
+const isProd = process.env.NODE_ENV === 'production';
 app.use(cors({
   origin: (origin, callback) => {
-    if (!origin || origin.startsWith('http://localhost:')) callback(null, true);
+    if (!origin
+      || config.corsOrigins.includes(origin)
+      || (!isProd && /^http:\/\/(localhost|127\.0\.0\.1):\d+$/.test(origin))) callback(null, true);
     else callback(new Error('Not allowed by CORS'));
   },
   credentials: true,
@@ -152,6 +226,7 @@ app.use(morgan('dev'));
 // Routes exemptées de la vérification de licence
 const LICENSE_EXEMPT = [
   '/health',
+  '/api/health',
   '/api/auth/login',
   '/api/auth/refresh',
   '/api/license/status',
@@ -191,8 +266,10 @@ app.use(async (req, res, next) => {
   }
 });
 // Rate limiting
-app.use('/api/',      rateLimit({ windowMs: 15*60*1000, max: 100, message: { error: 'Trop de requêtes' } }));
-app.use('/api/auth/', rateLimit({ windowMs: 15*60*1000, max: 10,  message: { error: 'Trop de tentatives' } }));
+// Limite générale large (une page = 2 à 4 appels) ; limite stricte sur la seule connexion,
+// le rafraîchissement de token ne doit pas épuiser le quota de tentatives
+app.use('/api/',           rateLimit({ windowMs: 15*60*1000, max: 1000, message: { error: 'Trop de requêtes' } }));
+app.use('/api/auth/login', rateLimit({ windowMs: 15*60*1000, max: 10,   message: { error: 'Trop de tentatives de connexion, réessayez dans 15 minutes' } }));
 
 // ════════════════════════════════════════════════════════════
 //  AUTH
@@ -288,6 +365,35 @@ app.get('/api/users', authenticate, authorize('rh', 'admin'), async (req, res) =
   } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
 });
 
+// GET /api/users/team — collaborateurs directs et leurs absences à venir (planning équipe)
+app.get('/api/users/team', authenticate, authorize('manager', 'director', 'rh', 'admin'), async (req, res) => {
+  try {
+    const from = req.query.from || new Date().toISOString().slice(0, 10);
+    const to   = req.query.to   || new Date(Date.now() + 60 * 864e5).toISOString().slice(0, 10);
+    const members = await db.many(
+      `SELECT u.id, u.first_name, u.last_name, u.role, u.email, p.name AS project
+       FROM users u LEFT JOIN projects p ON u.project_id = p.id
+       WHERE u.manager_id=$1 AND u.is_active=TRUE ORDER BY u.last_name, u.first_name`,
+      [req.user.id]
+    );
+    const leaves = await db.many(
+      `SELECT lr.id, lr.user_id, lr.start_date, lr.end_date, lr.days_count, lr.status,
+              lt.label AS type_label, lt.color
+       FROM leave_requests lr
+       JOIN leave_types lt ON lr.leave_type_id = lt.id
+       JOIN users u        ON lr.user_id = u.id
+       WHERE u.manager_id=$1 AND lr.status IN ('pending','approved')
+         AND NOT (lr.end_date < $2 OR lr.start_date > $3)
+       ORDER BY lr.start_date`,
+      [req.user.id, from, to]
+    );
+    res.json({ from, to, members, leaves });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
 // POST /api/users
 const createUserSchema = z.object({
   email:      z.string().email(),
@@ -297,9 +403,10 @@ const createUserSchema = z.object({
   role:       z.enum(['employee', 'manager', 'rh', 'director', 'admin']),
   project_id: z.string().uuid().optional(),
   manager_id: z.string().uuid().optional(),
+  hire_date:  z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
 }).superRefine((data, ctx) => {
-  if (data.role === 'employee' && !data.manager_id) {
-    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['manager_id'], message: 'Un superviseur est obligatoire pour un employé' });
+  if (['employee', 'manager'].includes(data.role) && !data.manager_id) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['manager_id'], message: 'Un superviseur est obligatoire pour ce rôle' });
   }
 });
 
@@ -319,15 +426,32 @@ const ensureManager = async (managerId) => {
 app.post('/api/users', authenticate, authorize('rh', 'admin'), validate(createUserSchema), async (req, res) => {
   try {
     const { password, ...data } = req.body;
+    if (data.role === 'admin' && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Seul un super administrateur peut créer un compte administrateur' });
+    }
     if (data.manager_id && !(await ensureManager(data.manager_id))) {
       return res.status(400).json({ error: 'Le superviseur sélectionné est invalide ou inactif' });
     }
+    if (req.license?.maxUsers) {
+      const { count } = await db.one('SELECT COUNT(*) AS count FROM users WHERE is_active=TRUE');
+      if (parseInt(count) >= req.license.maxUsers) {
+        return res.status(402).json({ error: `Limite de licence atteinte (${req.license.maxUsers} utilisateurs actifs)` });
+      }
+    }
     const hash = await bcrypt.hash(password, config.bcryptRounds);
     const user = await db.one(
-      `INSERT INTO users (email, password_hash, first_name, last_name, role, project_id, manager_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, email, first_name, last_name, role`,
+      `INSERT INTO users (email, password_hash, first_name, last_name, role, project_id, manager_id, hire_date)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,COALESCE($8::date, CURRENT_DATE)) RETURNING id, email, first_name, last_name, role`,
       [data.email.toLowerCase(), hash, data.first_name, data.last_name,
-       data.role, data.project_id || null, data.manager_id || null]
+       data.role, data.project_id || null, data.manager_id || null, data.hire_date || null]
+    );
+    // Soldes de l'année en cours pour tous les types actifs
+    await db.run(
+      `INSERT INTO leave_balances (user_id, leave_type_id, year, total_days, used_days, pending_days)
+       SELECT $1, id, EXTRACT(YEAR FROM CURRENT_DATE)::int, max_days_per_year, 0, 0
+       FROM leave_types WHERE is_active=TRUE
+       ON CONFLICT (user_id, leave_type_id, year) DO NOTHING`,
+      [user.id]
     );
     await audit(req.user.id, 'CREATE_USER', 'user', user.id, null, user, req);
     res.status(201).json(user);
@@ -346,16 +470,30 @@ app.patch('/api/users/:id', authenticate, authorize('rh', 'admin'), async (req, 
       if (!(await ensureManager(result.data.manager_id))) {
         return res.status(400).json({ error: 'Le superviseur sélectionné est invalide ou inactif' });
       }
+      if (result.data.manager_id === req.params.id) {
+        return res.status(400).json({ error: 'Un utilisateur ne peut pas être son propre superviseur' });
+      }
       const user = await db.one(
         'UPDATE users SET manager_id=$1, updated_at=NOW() WHERE id=$2 RETURNING id, manager_id',
         [result.data.manager_id, req.params.id]
       );
       if (!user) return res.status(404).json({ error: 'Utilisateur introuvable' });
+      await audit(req.user.id, 'ASSIGN_MANAGER', 'user', user.id, null, user, req);
       return res.json(user);
     }
     const { is_active } = req.body;
+    if (typeof is_active !== 'boolean') return res.status(400).json({ error: 'Statut invalide' });
+    if (req.params.id === req.user.id && !is_active) {
+      return res.status(400).json({ error: 'Vous ne pouvez pas désactiver votre propre compte' });
+    }
+    const target = await db.one('SELECT role FROM users WHERE id=$1', [req.params.id]);
+    if (target?.role === 'admin' && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Seul un super administrateur peut modifier ce compte' });
+    }
     const user = await db.one(
-      'UPDATE users SET is_active=$1, updated_at=NOW() WHERE id=$2 RETURNING id, email, is_active',
+      // Un compte désactivé perd aussi sa session
+      `UPDATE users SET is_active=$1, refresh_token=CASE WHEN $1 THEN refresh_token END, updated_at=NOW()
+       WHERE id=$2 RETURNING id, email, is_active`,
       [is_active, req.params.id]
     );
     if (!user) return res.status(404).json({ error: 'Utilisateur introuvable' });
@@ -427,8 +565,9 @@ app.patch('/api/projects/:id', authenticate, authorize('rh', 'admin'), async (re
       `UPDATE projects SET name=$1, description=$2, manager_id=$3,
        start_date=$4, end_date=$5, is_active=$6, updated_at=NOW()
        WHERE id=$7 RETURNING *`,
-      [name, description, manager_id, start_date, end_date, is_active, req.params.id]
+      [name, description, manager_id || null, start_date || null, end_date || null, is_active, req.params.id]
     );
+    if (!project) return res.status(404).json({ error: 'Projet introuvable' });
     await audit(req.user.id, 'UPDATE_PROJECT', 'project', project.id, null, project, req);
     res.json(project);
   } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
@@ -455,7 +594,7 @@ app.get('/api/balances/me', authenticate, async (req, res) => {
   try {
     const year = new Date().getFullYear();
     const balances = await db.many(
-      `SELECT lb.id, lb.total_days, lb.used_days, lb.pending_days, lb.carried_days,
+      `SELECT lb.id, lb.total_days, lb.used_days, lb.pending_days, lb.carried_days, lb.adjusted_days, lb.adjustment_note,
               lt.label, lt.color, lt.code, lt.max_days_per_year
        FROM leave_balances lb
        JOIN leave_types lt ON lb.leave_type_id = lt.id
@@ -470,38 +609,39 @@ app.get('/api/balances/me', authenticate, async (req, res) => {
 //  DEMANDES DE CONGÉS
 // ════════════════════════════════════════════════════════════
 
-// GET /api/requests
+// Colonnes communes aux listes de demandes
+const REQUEST_SELECT = `
+  SELECT lr.id, lr.user_id, lr.start_date, lr.end_date, lr.days_count, lr.reason,
+         lr.status, lr.current_level, lr.is_emergency, lr.rejection_note, lr.created_at,
+         (lr.document_url IS NOT NULL) AS has_document,
+         lt.label AS type_label, lt.color, lt.code AS type_code, lt.approval_levels,
+         u.first_name||' '||u.last_name AS user_name,
+         m.first_name||' '||m.last_name AS manager_name,
+         p.name AS department
+  FROM leave_requests lr
+  JOIN leave_types lt  ON lr.leave_type_id = lt.id
+  JOIN users u         ON lr.user_id = u.id
+  LEFT JOIN users m    ON u.manager_id = m.id
+  LEFT JOIN projects p ON u.project_id = p.id`;
+
+// GET /api/requests — demandes visibles (calendrier, tableaux de bord)
+//  employee : les siennes · manager : les siennes + son équipe directe · rh/admin/director : toutes
 app.get('/api/requests', authenticate, async (req, res) => {
   try {
     const { status, from, to } = req.query;
-    let sql = `
-      SELECT lr.id, lr.start_date, lr.end_date, lr.days_count, lr.reason,
-             lr.status, lr.is_emergency, lr.rejection_note, lr.created_at,
-             lt.label AS type_label, lt.color, lt.code AS type_code,
-             u.first_name||' '||u.last_name AS user_name,
-              m.first_name||' '||m.last_name AS manager_name,
-             p.name AS department
-      FROM leave_requests lr
-      JOIN leave_types lt  ON lr.leave_type_id = lt.id
-      JOIN users u         ON lr.user_id = u.id
-            LEFT JOIN users m    ON u.manager_id = m.id
-      LEFT JOIN projects p ON u.project_id = p.id
-      WHERE 1=1`;
+    let sql = REQUEST_SELECT + ' WHERE 1=1';
     const params = [];
     let pi = 1;
 
     if (req.user.role === 'employee') {
       sql += ` AND lr.user_id=$${pi++}`; params.push(req.user.id);
     } else if (req.user.role === 'manager') {
-      sql += ` AND u.manager_id=$${pi++} AND lr.current_level=1`; params.push(req.user.id);
-    } else if (req.user.role === 'rh') {
-      sql += ` AND lr.current_level=2 AND lr.status='pending'`;
+      sql += ` AND (lr.user_id=$${pi} OR u.manager_id=$${pi})`; pi++; params.push(req.user.id);
     }
-    // admin/director : toutes les demandes
 
-    if (status && status !== 'pending') { sql += ` AND lr.status=$${pi++}`; params.push(status); }
-    if (from) { sql += ` AND lr.start_date>=$${pi++}`; params.push(from); }
-    if (to)   { sql += ` AND lr.end_date<=$${pi++}`;   params.push(to); }
+    if (status) { sql += ` AND lr.status=$${pi++}`; params.push(status); }
+    if (from)   { sql += ` AND lr.end_date>=$${pi++}`; params.push(from); }
+    if (to)     { sql += ` AND lr.start_date<=$${pi++}`; params.push(to); }
 
     sql += ' ORDER BY lr.created_at DESC';
     res.json(await db.many(sql, params));
@@ -511,24 +651,87 @@ app.get('/api/requests', authenticate, async (req, res) => {
   }
 });
 
-// GET /api/requests/all — historique complet pour l'employé
+// GET /api/requests/to-validate — uniquement les demandes sur lesquelles l'utilisateur peut agir
+app.get('/api/requests/to-validate', authenticate, async (req, res) => {
+  try {
+    if (req.user.role === 'employee') return res.json([]);
+    const rows = await db.many(
+      REQUEST_SELECT.replace('FROM leave_requests lr', `,
+         (SELECT b.total_days - b.used_days - b.pending_days FROM leave_balances b
+          WHERE b.user_id = lr.user_id AND b.leave_type_id = lr.leave_type_id
+            AND b.year = EXTRACT(YEAR FROM lr.start_date)) AS balance_after
+       FROM leave_requests lr`) + `
+      WHERE lr.status='pending' AND lr.user_id <> $1
+        AND ( $2 = 'admin'
+           OR (lr.current_level=1 AND u.manager_id=$1)
+           OR (lr.current_level=2 AND $2 = 'rh') )
+      ORDER BY lr.is_emergency DESC, lr.start_date`,
+      [req.user.id, req.user.role]
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// GET /api/requests/all — historique complet de l'utilisateur connecté
 app.get('/api/requests/all', authenticate, async (req, res) => {
   try {
-    let sql = `
-      SELECT lr.id, lr.start_date, lr.end_date, lr.days_count, lr.reason,
-             lr.status, lr.is_emergency, lr.rejection_note, lr.created_at,
-             lt.label AS type_label, lt.color, lt.code AS type_code,
-             u.first_name||' '||u.last_name AS user_name,
-              m.first_name||' '||m.last_name AS manager_name,
-             p.name AS department
-      FROM leave_requests lr
-      JOIN leave_types lt  ON lr.leave_type_id = lt.id
-      JOIN users u         ON lr.user_id = u.id
-            LEFT JOIN users m    ON u.manager_id = m.id
-      LEFT JOIN projects p ON u.project_id = p.id
+    const rows = await db.many(
+      REQUEST_SELECT.replace('FROM leave_requests lr', `,
+         (SELECT d.first_name||' '||d.last_name FROM users d
+          WHERE d.role='director' AND d.is_active=TRUE ORDER BY d.created_at LIMIT 1) AS director_name
+       FROM leave_requests lr`) + `
       WHERE lr.user_id=$1
-      ORDER BY lr.created_at DESC`;
-    res.json(await db.many(sql, [req.user.id]));
+      ORDER BY lr.created_at DESC`,
+      [req.user.id]
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// GET /api/requests/:id/steps — historique du circuit de validation
+app.get('/api/requests/:id/steps', authenticate, async (req, res) => {
+  try {
+    const request = await db.one(
+      `SELECT lr.user_id, u.manager_id FROM leave_requests lr JOIN users u ON lr.user_id=u.id WHERE lr.id=$1`,
+      [req.params.id]
+    );
+    if (!request) return res.status(404).json({ error: 'Demande introuvable' });
+    const allowed = request.user_id === req.user.id || request.manager_id === req.user.id
+      || ['rh', 'admin', 'director'].includes(req.user.role);
+    if (!allowed) return res.status(403).json({ error: 'Accès refusé' });
+    res.json(await db.many(
+      `SELECT s.level, s.action, s.comment, s.acted_at, u.first_name||' '||u.last_name AS approver_name, u.role
+       FROM approval_steps s JOIN users u ON s.approver_id=u.id
+       WHERE s.request_id=$1 ORDER BY s.acted_at`,
+      [req.params.id]
+    ));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// GET /api/requests/:id/document — justificatif (demandeur, valideurs, RH, direction)
+app.get('/api/requests/:id/document', authenticate, async (req, res) => {
+  try {
+    const request = await db.one(
+      `SELECT lr.user_id, lr.document_url, u.manager_id
+       FROM leave_requests lr JOIN users u ON lr.user_id=u.id WHERE lr.id=$1`,
+      [req.params.id]
+    );
+    if (!request?.document_url) return res.status(404).json({ error: 'Aucun justificatif' });
+    const allowed = request.user_id === req.user.id || request.manager_id === req.user.id
+      || ['rh', 'admin', 'director'].includes(req.user.role);
+    if (!allowed) return res.status(403).json({ error: 'Accès refusé' });
+    const file = path.join(config.uploadDir, path.basename(request.document_url));
+    if (!fs.existsSync(file)) return res.status(404).json({ error: 'Fichier introuvable' });
+    res.sendFile(file);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Erreur serveur' });
@@ -542,28 +745,40 @@ const requestSchema = z.object({
   end_date:      z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   reason:        z.string().max(1000).optional(),
   is_emergency:  z.boolean().default(false),
+  document:      z.object({
+    name: z.string().max(255),
+    type: z.string(),
+    data: z.string().max(5 * 1024 * 1024),
+  }).optional(),
 }).refine(d => new Date(d.end_date) >= new Date(d.start_date), {
   message: 'La date de fin doit être après la date de début',
 });
 
 app.post('/api/requests', authenticate, validate(requestSchema), async (req, res) => {
   try {
-    const { leave_type_id, start_date, end_date, reason, is_emergency } = req.body;
-    const year = new Date(start_date).getFullYear();
+    const { leave_type_id, start_date, end_date, reason, is_emergency, document } = req.body;
+    if (start_date.slice(0, 4) !== end_date.slice(0, 4)) {
+      return res.status(422).json({ error: 'Une demande ne peut pas chevaucher deux années : faites deux demandes' });
+    }
+    const type = await db.one('SELECT * FROM leave_types WHERE id=$1 AND is_active=TRUE', [leave_type_id]);
+    if (!type) return res.status(422).json({ error: 'Type de congé invalide ou inactif' });
+    if (type.requires_document && !document) {
+      return res.status(422).json({ error: `Un justificatif est obligatoire pour « ${type.label} »` });
+    }
+
+    const year = parseInt(start_date.slice(0, 4));
     const days = await calcBusinessDays(start_date, end_date);
     if (days === 0) return res.status(422).json({ error: 'Aucun jour ouvré dans la période sélectionnée' });
 
-    const balance = await db.one(
-      'SELECT * FROM leave_balances WHERE user_id=$1 AND leave_type_id=$2 AND year=$3',
-      [req.user.id, leave_type_id, year]
-    );
-    if (balance) {
-      const available = balance.total_days - balance.used_days - balance.pending_days;
-      if (available < days) return res.status(422).json({ error: 'Solde insuffisant', available: parseFloat(available), requested: days });
+    const balance   = await ensureBalance(req.user.id, leave_type_id, year);
+    const available = parseFloat(balance.total_days) - parseFloat(balance.used_days) - parseFloat(balance.pending_days);
+    if (available < days) {
+      return res.status(422).json({ error: `Solde insuffisant : ${available} j disponible(s), ${days} j demandé(s)`, available, requested: days });
     }
 
+    const autoApprove = !type.requires_approval || type.approval_levels === 0;
     const user = await db.one('SELECT manager_id, first_name, last_name FROM users WHERE id=$1', [req.user.id]);
-    if (!user?.manager_id) {
+    if (!autoApprove && !user?.manager_id) {
       return res.status(422).json({ error: 'Aucun superviseur n’est affecté à votre compte. Contactez les RH.' });
     }
 
@@ -575,25 +790,36 @@ app.post('/api/requests', authenticate, validate(requestSchema), async (req, res
     );
     if (overlap) return res.status(409).json({ error: 'Cette période chevauche une demande existante' });
 
-    const request = await db.one(
-      `INSERT INTO leave_requests (user_id, leave_type_id, start_date, end_date, days_count, reason, is_emergency)
-       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-      [req.user.id, leave_type_id, start_date, end_date, days, reason || null, is_emergency]
-    );
+    const documentName = document ? saveDocument(document) : null;
 
-    if (balance) {
-      await db.run('UPDATE leave_balances SET pending_days=pending_days+$1 WHERE id=$2', [days, balance.id]);
+    let request = await db.one(
+      `INSERT INTO leave_requests (user_id, leave_type_id, start_date, end_date, days_count, reason, is_emergency, document_url)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [req.user.id, leave_type_id, start_date, end_date, days, reason || null, is_emergency, documentName]
+    );
+    await db.run('UPDATE leave_balances SET pending_days=pending_days+$1 WHERE id=$2', [days, balance.id]);
+
+    const who = `${user.first_name} ${user.last_name}`;
+    if (autoApprove) {
+      // Passage pending → approved : le trigger update_balance_on_approval bascule les jours en "utilisés"
+      request = await db.one(
+        `UPDATE leave_requests SET status='approved', updated_at=NOW() WHERE id=$1 RETURNING *`, [request.id]
+      );
+      await notify(req.user.id, 'request_approved', '✓ Absence enregistrée',
+        `Votre ${type.label.toLowerCase()} de ${days} jour(s) est enregistrée (validation automatique).`, request.id);
+      if (user.manager_id) {
+        await notify(user.manager_id, 'system', 'Absence déclarée',
+          `${who} a déclaré ${days} jour(s) de ${type.label.toLowerCase()}.`, request.id);
+      }
+    } else {
+      await notify(user.manager_id, 'request_submitted', 'Nouvelle demande de congé',
+        `${who} a soumis une demande de ${days} jour(s)${is_emergency ? ' (urgence)' : ''}`, request.id);
     }
 
-    await db.run(
-      `INSERT INTO notifications (user_id, type, title, message, request_id) VALUES ($1,'request_submitted',$2,$3,$4)`,
-      [user.manager_id, 'Nouvelle demande de congé',
-       `${user.first_name} ${user.last_name} a soumis une demande de ${days} jour(s)`, request.id]
-    );
-
     await audit(req.user.id, 'CREATE_REQUEST', 'leave_request', request.id, null, request, req);
-    res.status(201).json(request);
+    res.status(201).json({ ...request, auto_approved: autoApprove });
   } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
     console.error(err);
     res.status(500).json({ error: 'Erreur serveur' });
   }
@@ -604,14 +830,21 @@ app.patch('/api/requests/:id/approve', authenticate, authorize('manager', 'rh', 
   try {
     const { action, comment } = req.body;
     if (!['approved', 'rejected'].includes(action)) return res.status(400).json({ error: 'Action invalide' });
+    if (action === 'rejected' && !comment?.trim()) return res.status(400).json({ error: 'Le motif du rejet est obligatoire' });
 
     const request = await db.one(
-      `SELECT lr.*, lt.approval_levels FROM leave_requests lr
-       JOIN leave_types lt ON lr.leave_type_id = lt.id WHERE lr.id=$1`,
+      `SELECT lr.*, lt.approval_levels, u.manager_id AS requester_manager_id
+       FROM leave_requests lr
+       JOIN leave_types lt ON lr.leave_type_id = lt.id
+       JOIN users u        ON lr.user_id = u.id
+       WHERE lr.id=$1`,
       [req.params.id]
     );
     if (!request) return res.status(404).json({ error: 'Demande introuvable' });
     if (request.status !== 'pending') return res.status(409).json({ error: 'Demande déjà traitée' });
+    if (!canValidate(req.user, request, request.requester_manager_id)) {
+      return res.status(403).json({ error: 'Vous n’êtes pas le valideur attendu pour cette étape' });
+    }
 
     await db.run(
       `INSERT INTO approval_steps (request_id, approver_id, level, action, comment, acted_at)
@@ -619,46 +852,33 @@ app.patch('/api/requests/:id/approve', authenticate, authorize('manager', 'rh', 
       [request.id, req.user.id, request.current_level, action, comment || null]
     );
 
-    let newStatus = request.status;
+    let newStatus = 'pending';
     let newLevel  = request.current_level;
-
-    if (action === 'rejected') {
-      newStatus = 'rejected';
-    } else if (request.current_level < request.approval_levels) {
-      newLevel  = request.current_level + 1;
-      newStatus = 'pending';
-    } else {
-      newStatus = 'approved';
-    }
+    if (action === 'rejected')                                  newStatus = 'rejected';
+    else if (request.current_level < request.approval_levels)   newLevel  = request.current_level + 1;
+    else                                                        newStatus = 'approved';
 
     const updated = await db.one(
       `UPDATE leave_requests SET status=$1, current_level=$2, rejection_note=$3, updated_at=NOW()
-       WHERE id=$4 RETURNING *`,
-      [newStatus, newLevel, action === 'rejected' ? (comment || 'Refusée') : null, request.id]
+       WHERE id=$4 AND status='pending' RETURNING *`,
+      [newStatus, newLevel, action === 'rejected' ? comment : null, request.id]
     );
+    if (!updated) return res.status(409).json({ error: 'Demande déjà traitée' });
 
-    if (newStatus === 'approved' || newStatus === 'rejected') {
-      await db.run(
-        `INSERT INTO notifications (user_id, type, title, message, request_id) VALUES ($1,$2,$3,$4,$5)`,
-        [request.user_id,
-         newStatus === 'approved' ? 'request_approved' : 'request_rejected',
-         newStatus === 'approved' ? '✓ Demande approuvée' : 'Demande rejetée',
-         newStatus === 'approved' ? 'Votre demande a été approuvée.' : `Refusée. Motif : ${comment || 'Non précisé'}`,
-         request.id]
-      );
+    if (newStatus === 'approved') {
+      await notify(request.user_id, 'request_approved', '✓ Demande approuvée',
+        `Votre demande du ${request.start_date.split('-').reverse().join('/')} (${parseFloat(request.days_count)} j) a été approuvée.`
+        + (comment ? ` Commentaire : ${comment}` : ''), request.id);
+    } else if (newStatus === 'rejected') {
+      await notify(request.user_id, 'request_rejected', 'Demande rejetée', `Refusée. Motif : ${comment}`, request.id);
+    } else {
+      await notify(request.user_id, 'system', 'Demande validée par votre superviseur',
+        'Votre demande est maintenant en attente de validation RH.', request.id);
+      await notifyRoles(['rh'], 'request_submitted', 'Validation RH requise',
+        'Une demande validée par le superviseur attend votre validation RH.', request.id);
     }
 
-    if (newStatus === 'pending' && newLevel === 2) {
-      const rh = await db.one(`SELECT id FROM users WHERE role IN ('rh','admin') LIMIT 1`);
-      if (rh) {
-        await db.run(
-          `INSERT INTO notifications (user_id, type, title, message, request_id) VALUES ($1,'request_submitted',$2,$3,$4)`,
-          [rh.id, 'Validation RH requise', 'Une demande attend votre validation RH.', request.id]
-        );
-      }
-    }
-
-    await audit(req.user.id, action.toUpperCase()+'_REQUEST', 'leave_request', request.id, request, updated, req);
+    await audit(req.user.id, action.toUpperCase() + '_REQUEST', 'leave_request', request.id, request, updated, req);
     res.json(updated);
   } catch (err) {
     console.error(err);
@@ -666,13 +886,13 @@ app.patch('/api/requests/:id/approve', authenticate, authorize('manager', 'rh', 
   }
 });
 
-// DELETE /api/requests/:id
+// DELETE /api/requests/:id — annulation par le demandeur (tant que non traitée)
 app.delete('/api/requests/:id', authenticate, async (req, res) => {
   try {
     const request = await db.one('SELECT * FROM leave_requests WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
     if (!request) return res.status(404).json({ error: 'Demande introuvable' });
     if (!['pending', 'draft'].includes(request.status)) return res.status(409).json({ error: 'Impossible d\'annuler une demande traitée' });
-    await db.run('UPDATE leave_requests SET status=$1 WHERE id=$2', ['cancelled', request.id]);
+    await db.run(`UPDATE leave_requests SET status='cancelled', updated_at=NOW() WHERE id=$1`, [request.id]);
     await audit(req.user.id, 'CANCEL_REQUEST', 'leave_request', request.id, request, { status: 'cancelled' }, req);
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
@@ -691,11 +911,16 @@ app.get('/api/leave-types', authenticate, async (req, res) => {
 app.post('/api/leave-types', authenticate, authorize('rh', 'admin'), async (req, res) => {
   try {
     const { code, label, color, max_days_per_year, requires_approval, requires_document, approval_levels } = req.body;
+    if (!code?.trim() || !label?.trim()) return res.status(400).json({ error: 'Code et libellé obligatoires' });
+    const levels = [0, 1, 2].includes(approval_levels) ? approval_levels : 1;
     const t = await db.one(
       `INSERT INTO leave_types (code, label, color, max_days_per_year, requires_approval, requires_document, approval_levels)
        VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-      [code, label, color || '#3B82F6', max_days_per_year || 25, requires_approval ?? true, requires_document ?? false, approval_levels || 1]
+      // 0 niveau ⇔ pas de validation : les deux champs restent cohérents
+      [code.trim().toUpperCase(), label.trim(), color || '#3B82F6', max_days_per_year || 25,
+       levels > 0 && (requires_approval ?? true), requires_document ?? false, levels]
     );
+    await audit(req.user.id, 'CREATE_LEAVE_TYPE', 'leave_type', t.id, null, t, req);
     res.status(201).json(t);
   } catch (err) {
     if (err.code === '23505') return res.status(409).json({ error: 'Ce code existe déjà' });
@@ -706,7 +931,11 @@ app.post('/api/leave-types', authenticate, authorize('rh', 'admin'), async (req,
 app.patch('/api/leave-types/:id', authenticate, authorize('rh', 'admin'), async (req, res) => {
   try {
     const { is_active } = req.body;
-    res.json(await db.one('UPDATE leave_types SET is_active=$1 WHERE id=$2 RETURNING *', [is_active, req.params.id]));
+    if (typeof is_active !== 'boolean') return res.status(400).json({ error: 'Statut invalide' });
+    const t = await db.one('UPDATE leave_types SET is_active=$1 WHERE id=$2 RETURNING *', [is_active, req.params.id]);
+    if (!t) return res.status(404).json({ error: 'Type introuvable' });
+    await audit(req.user.id, 'UPDATE_LEAVE_TYPE', 'leave_type', t.id, null, { is_active }, req);
+    res.json(t);
   } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
 });
 
@@ -730,8 +959,9 @@ app.post('/api/holidays', authenticate, authorize('rh', 'admin'), async (req, re
     if (!date || !label) return res.status(400).json({ error: 'Date et libellé requis' });
     const h = await db.one(
       'INSERT INTO holidays (date, label, created_by) VALUES ($1,$2,$3) RETURNING *',
-      [date, label, req.user.id]
+      [date, label.trim(), req.user.id]
     );
+    await audit(req.user.id, 'CREATE_HOLIDAY', 'holiday', h.id, null, h, req);
     res.status(201).json(h);
   } catch (err) {
     if (err.code === '23505') return res.status(409).json({ error: 'Ce jour férié existe déjà' });
@@ -741,7 +971,9 @@ app.post('/api/holidays', authenticate, authorize('rh', 'admin'), async (req, re
 
 app.delete('/api/holidays/:id', authenticate, authorize('rh', 'admin'), async (req, res) => {
   try {
-    await db.run('DELETE FROM holidays WHERE id=$1', [req.params.id]);
+    const h = await db.one('DELETE FROM holidays WHERE id=$1 RETURNING *', [req.params.id]);
+    if (!h) return res.status(404).json({ error: 'Jour férié introuvable' });
+    await audit(req.user.id, 'DELETE_HOLIDAY', 'holiday', h.id, h, null, req);
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
 });
@@ -772,6 +1004,42 @@ app.get('/api/stats', authenticate, authorize('rh', 'admin', 'director'), async 
   } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
 });
 
+// GET /api/stats/export?year= — toutes les demandes de l'année en CSV (ouvrable dans Excel)
+app.get('/api/stats/export', authenticate, authorize('rh', 'admin', 'director'), async (req, res) => {
+  try {
+    const year = parseInt(req.query.year) || new Date().getFullYear();
+    const rows = await db.many(
+      `SELECT u.last_name, u.first_name, u.email, p.name AS project, lt.label AS type,
+              lr.start_date, lr.end_date, lr.days_count, lr.status, lr.is_emergency,
+              lr.reason, lr.rejection_note, lr.created_at
+       FROM leave_requests lr
+       JOIN users u        ON lr.user_id = u.id
+       JOIN leave_types lt ON lr.leave_type_id = lt.id
+       LEFT JOIN projects p ON u.project_id = p.id
+       WHERE EXTRACT(YEAR FROM lr.start_date)=$1
+       ORDER BY lr.start_date, u.last_name`,
+      [year]
+    );
+    const STATUS = { pending: 'En attente', approved: 'Approuvée', rejected: 'Rejetée', cancelled: 'Annulée', draft: 'Brouillon' };
+    const d   = (v) => v ? new Date(v).toLocaleDateString('fr-FR', { timeZone: 'UTC' }) : '';
+    const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    const header = ['Nom', 'Prénom', 'Email', 'Projet', 'Type', 'Début', 'Fin', 'Jours ouvrés', 'Statut', 'Urgence', 'Motif', 'Motif de rejet', 'Soumise le'];
+    const lines = rows.map(r => [
+      r.last_name, r.first_name, r.email, r.project, r.type, d(r.start_date), d(r.end_date),
+      String(r.days_count).replace('.', ','), STATUS[r.status] || r.status, r.is_emergency ? 'Oui' : 'Non',
+      r.reason, r.rejection_note, d(r.created_at),
+    ].map(esc).join(';'));
+    await audit(req.user.id, 'EXPORT_STATS', 'leave_request', null, null, { year, rows: rows.length }, req);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="ecogec_absences_${year}.csv"`);
+    // BOM + « ; » : Excel en français ouvre le fichier directement avec les accents
+    res.send('﻿' + [header.map(esc).join(';'), ...lines].join('\r\n'));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
 // ════════════════════════════════════════════════════════════
 //  NOTIFICATIONS
 // ════════════════════════════════════════════════════════════
@@ -782,6 +1050,20 @@ app.get('/api/notifications', authenticate, async (req, res) => {
       'SELECT * FROM notifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50',
       [req.user.id]
     ));
+  } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
+});
+
+app.get('/api/notifications/unread-count', authenticate, async (req, res) => {
+  try {
+    const r = await db.one('SELECT COUNT(*) AS count FROM notifications WHERE user_id=$1 AND is_read=FALSE', [req.user.id]);
+    res.json({ count: parseInt(r.count) });
+  } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
+});
+
+app.patch('/api/notifications/read-all', authenticate, async (req, res) => {
+  try {
+    await db.run('UPDATE notifications SET is_read=TRUE WHERE user_id=$1 AND is_read=FALSE', [req.user.id]);
+    res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
 });
 
@@ -799,7 +1081,9 @@ app.patch('/api/notifications/:id/read', authenticate, async (req, res) => {
 app.get('/api/audit-logs', authenticate, authorize('rh', 'admin'), async (req, res) => {
   try {
     res.json(await db.many(
-      `SELECT al.*, u.first_name||' '||u.last_name AS user_name
+      // Pas d'old_value/new_value ni de user_agent : l'écran n'en a pas besoin
+      `SELECT al.id, al.user_id, al.action, al.entity_type, al.entity_id, al.ip_address, al.created_at,
+              u.first_name||' '||u.last_name AS user_name
        FROM audit_logs al LEFT JOIN users u ON al.user_id=u.id
        ORDER BY al.created_at DESC LIMIT 500`
     ));
@@ -827,6 +1111,12 @@ app.get('/api/admin/db-stats', authenticate, authorize('admin'), async (req, res
                FROM pg_stat_user_tables ORDER BY seq_scan DESC LIMIT 8`),
       db.one('SELECT COUNT(*) AS count FROM pg_stat_activity'),
     ]);
+    const balance_anomalies = await db.many(
+      `SELECT u.first_name||' '||u.last_name AS user_name, lt.label AS type_label, v.year, v.anomalie,
+              v.total_days, v.used_days, v.pending_days, v.adjusted_days, v.approved_days, v.pending_calc
+       FROM v_balance_check v JOIN users u ON u.id=v.user_id JOIN leave_types lt ON lt.id=v.leave_type_id
+       ORDER BY u.last_name, v.year`
+    );
     const uptime = process.uptime();
     const h = Math.floor(uptime / 3600);
     const m = Math.floor((uptime % 3600) / 60);
@@ -843,6 +1133,7 @@ app.get('/api/admin/db-stats', authenticate, authorize('admin'), async (req, res
       tables,
       query_stats:        queryStats,
       active_connections: activeConn.count,
+      balance_anomalies,
     });
   } catch (err) {
     console.error(err);
@@ -868,21 +1159,22 @@ app.post('/api/admin/maintenance', authenticate, authorize('admin'), async (req,
         const ra = await db.one(`WITH d AS (DELETE FROM audit_logs WHERE created_at < NOW() - INTERVAL '90 days' RETURNING 1) SELECT COUNT(*) AS count FROM d`);
         message = `${ra?.count || 0} log(s) archivé(s).`; break;
       case 'generate_balances':
-        const nextYear  = new Date().getFullYear() + 1;
-        const employees = await db.many(`SELECT id FROM users WHERE is_active=TRUE`);
-        const types     = await db.many(`SELECT id, max_days_per_year FROM leave_types WHERE is_active=TRUE`);
-        let created = 0;
-        for (const emp of employees) {
-          for (const type of types) {
-            await db.run(
-              `INSERT INTO leave_balances (user_id, leave_type_id, year, total_days, used_days, pending_days)
-               VALUES ($1,$2,$3,$4,0,0) ON CONFLICT (user_id, leave_type_id, year) DO NOTHING`,
-              [emp.id, type.id, nextYear, type.max_days_per_year]
-            );
-            created++;
-          }
-        }
-        message = `${created} solde(s) générés pour ${nextYear}.`; break;
+        // Année demandée (par défaut l'année suivante) ; les soldes existants ne sont pas modifiés
+        const target = parseInt(req.body.year) || new Date().getFullYear() + 1;
+        const rg = await db.one(
+          `WITH ins AS (
+             INSERT INTO leave_balances (user_id, leave_type_id, year, total_days, used_days, pending_days)
+             SELECT u.id, lt.id, $1, lt.max_days_per_year, 0, 0
+             FROM users u CROSS JOIN leave_types lt
+             WHERE u.is_active=TRUE AND lt.is_active=TRUE
+             ON CONFLICT (user_id, leave_type_id, year) DO NOTHING RETURNING 1)
+           SELECT COUNT(*) AS count FROM ins`,
+          [target]
+        );
+        message = `${rg.count} solde(s) créé(s) pour ${target} (les soldes existants sont conservés).`; break;
+      case 'recompute_balances':
+        const rb = await db.one('SELECT recompute_balances() AS count');
+        message = `${rb.count} solde(s) recalculé(s) à partir des demandes (ajustements de reprise conservés).`; break;
       case 'revoke_all_sessions':
         await db.run(`UPDATE users SET refresh_token=NULL`);
         message = 'Toutes les sessions révoquées.'; break;
@@ -1061,7 +1353,7 @@ app.delete('/api/license/:id', authenticate, authorize('admin'), async (req, res
 //  HEALTH CHECK
 // ════════════════════════════════════════════════════════════
 
-app.get('/health', async (req, res) => {
+app.get(['/health', '/api/health'], async (req, res) => {
   try {
     await pool.query('SELECT 1');
     res.json({ status: 'ok', db: 'connected', app: 'EcoGec', timestamp: new Date() });

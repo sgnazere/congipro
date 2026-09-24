@@ -235,7 +235,7 @@ export default function Projects() {
       {/* Modal création projet */}
       {showAdd && (
         <div
-          style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.45)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: '1rem' }}
+          className="modal-backdrop"
           onClick={e => { if (e.target === e.currentTarget) setShowAdd(false) }}
         >
           <div className="card" style={{ width: '100%', maxWidth: 520 }}>
@@ -309,7 +309,7 @@ export default function Projects() {
       {/* Modal édition projet */}
       {showEdit && (
         <div
-          style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.45)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: '1rem' }}
+          className="modal-backdrop"
           onClick={e => { if (e.target === e.currentTarget) setShowEdit(null) }}
         >
           <div className="card" style={{ width: '100%', maxWidth: 520 }}>

@@ -1,36 +1,45 @@
 import { useEffect, useState } from 'react'
 import api from '../api/axios'
+import useAuthStore from '../store/authStore'
+import { ROLE_LABELS } from '../navigation'
+import { fmtDate } from '../utils/dates'
 
-const ROLES: Record<string, string> = {
-  employee: 'Employé',
-  manager:  'Manager',
-  rh:       'RH / Admin',
-}
 const ROLE_COLORS: Record<string, string> = {
   employee: '#3B82F6',
   manager:  '#8B5CF6',
   rh:       '#10B981',
+  director: '#F59E0B',
+  admin:    '#EF4444',
 }
+const SUPERVISOR_ROLES = ['manager', 'rh', 'director', 'admin']
+const NEEDS_SUPERVISOR = ['employee', 'manager']
+// Sans superviseur, ces rôles ne peuvent pas poser de congé soumis à validation
+const SHOULD_HAVE_SUPERVISOR = ['employee', 'manager', 'rh']
 
 const emptyForm = {
-  first_name: '', last_name: '', email: '',
-  password: '', role: 'employee', project_id: '', manager_id: '',
+  first_name: '', last_name: '', email: '', password: '',
+  role: 'employee', project_id: '', manager_id: '', hire_date: '',
 }
 
 export default function Users() {
-  const [users,   setUsers]   = useState<any[]>([])
-  const [loading, setLoading] = useState(true)
-  const [showAdd, setShowAdd] = useState(false)
-  const [form,    setForm]    = useState(emptyForm)
-  const [msg,     setMsg]     = useState<{ type: string; text: string } | null>(null)
-  const [saving,  setSaving]  = useState(false)
-  const [search,  setSearch]  = useState('')
+  const { user: me } = useAuthStore()
+  const [users,    setUsers]    = useState<any[]>([])
+  const [projects, setProjects] = useState<any[]>([])
+  const [loading,  setLoading]  = useState(true)
+  const [showAdd,  setShowAdd]  = useState(false)
+  const [form,     setForm]     = useState(emptyForm)
+  const [msg,      setMsg]      = useState<{ type: string; text: string } | null>(null)
+  const [formMsg,  setFormMsg]  = useState<string | null>(null)
+  const [saving,   setSaving]   = useState(false)
+  const [search,   setSearch]   = useState('')
+  const [roleFilter, setRoleFilter] = useState('all')
 
   const load = async () => {
     setLoading(true)
     try {
-      const u = await api.get('/users')
+      const [u, p] = await Promise.all([api.get('/users'), api.get('/projects')])
       setUsers(u.data)
+      setProjects(p.data)
     } catch (err) {
       console.error(err)
     } finally {
@@ -40,47 +49,50 @@ export default function Users() {
 
   useEffect(() => { load() }, [])
 
+  const supervisors = users.filter(u => SUPERVISOR_ROLES.includes(u.role) && u.is_active)
+  const nameOf = (id: string) => { const s = users.find(u => u.id === id); return s ? `${s.first_name} ${s.last_name}` : '' }
+
   const handleAdd = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!form.first_name || !form.last_name || !form.email || !form.password) {
-      setMsg({ type: 'danger', text: 'Veuillez remplir tous les champs obligatoires.' })
+    if (NEEDS_SUPERVISOR.includes(form.role) && !form.manager_id) {
+      setFormMsg('Choisissez un superviseur : il validera les demandes de cette personne.')
       return
     }
+    if (form.password.length < 8) { setFormMsg('Le mot de passe doit contenir au moins 8 caractères.'); return }
     setSaving(true)
-    setMsg(null)
+    setFormMsg(null)
     try {
       await api.post('/users', {
         ...form,
-        project_id:    form.project_id    || undefined,
+        project_id: form.project_id || undefined,
         manager_id: form.manager_id || undefined,
+        hire_date:  form.hire_date  || undefined,
       })
-      setMsg({ type: 'success', text: '✅ Utilisateur créé avec succès !' })
+      setMsg({ type: 'success', text: `✅ Compte de ${form.first_name} ${form.last_name} créé. Ses soldes ${new Date().getFullYear()} ont été initialisés.` })
       setForm(emptyForm)
       setShowAdd(false)
       load()
     } catch (err: any) {
-      setMsg({ type: 'danger', text: '❌ ' + (err.response?.data?.error || 'Erreur serveur') })
+      setFormMsg(err.response?.data?.error || 'Erreur serveur')
     } finally {
       setSaving(false)
     }
   }
 
-  const toggleActive = async (userId: string, current: boolean) => {
+  const toggleActive = async (u: any) => {
     try {
-      await api.patch(`/users/${userId}`, { is_active: !current })
-      setUsers(us => us.map(u => u.id === userId ? { ...u, is_active: !current } : u))
-    } catch (err) {
-      console.error(err)
+      await api.patch(`/users/${u.id}`, { is_active: !u.is_active })
+      setUsers(us => us.map(x => x.id === u.id ? { ...x, is_active: !u.is_active } : x))
+      setMsg({ type: 'success', text: `${u.first_name} ${u.last_name} : compte ${u.is_active ? 'désactivé' : 'réactivé'}.` })
+    } catch (err: any) {
+      setMsg({ type: 'danger', text: err.response?.data?.error || 'Erreur' })
     }
   }
 
   const assignManager = async (userId: string, managerId: string) => {
     try {
       await api.patch(`/users/${userId}`, { manager_id: managerId })
-      setUsers(us => us.map(u => u.id === userId
-        ? { ...u, manager_id: managerId, manager_name: managers.find(m => m.id === managerId)?.first_name + ' ' + managers.find(m => m.id === managerId)?.last_name }
-        : u
-      ))
+      setUsers(us => us.map(u => u.id === userId ? { ...u, manager_id: managerId, manager_name: nameOf(managerId) } : u))
       setMsg({ type: 'success', text: 'Superviseur affecté avec succès.' })
     } catch (err: any) {
       setMsg({ type: 'danger', text: err.response?.data?.error || 'Erreur lors de l’affectation du superviseur' })
@@ -88,24 +100,28 @@ export default function Users() {
   }
 
   const filtered = users.filter(u =>
-    `${u.first_name} ${u.last_name} ${u.email}`.toLowerCase().includes(search.toLowerCase())
+    (roleFilter === 'all' || u.role === roleFilter) &&
+    `${u.first_name} ${u.last_name} ${u.email} ${u.project || ''}`.toLowerCase().includes(search.toLowerCase())
   )
-
-  const managers = users.filter(u => u.role === 'manager' || u.role === 'rh')
+  const withoutSupervisor = users.filter(u => SHOULD_HAVE_SUPERVISOR.includes(u.role) && u.is_active && !u.manager_id).length
 
   if (loading) return <div className="loader-wrap"><div className="loader" /></div>
 
   return (
     <div>
       {msg && <div className={`alert alert-${msg.type}`}>{msg.text}</div>}
+      {withoutSupervisor > 0 && (
+        <div className="alert alert-warn">
+          ⚠️ {withoutSupervisor} utilisateur(s) sans superviseur : ils ne peuvent pas soumettre de demande soumise à validation.
+        </div>
+      )}
 
-      {/* Stats */}
       <div className="stat-grid" style={{ gridTemplateColumns: 'repeat(4,1fr)' }}>
         {[
-          { label: 'Total',      val: users.length,                                    color: 'var(--accent)'  },
-          { label: 'Employés',   val: users.filter(u => u.role === 'employee').length, color: '#3B82F6'        },
-          { label: 'Managers',   val: users.filter(u => u.role === 'manager').length,  color: '#8B5CF6'        },
-          { label: 'Actifs',     val: users.filter(u => u.is_active).length,           color: 'var(--success)' },
+          { label: 'Total',       val: users.length,                                                  color: 'var(--accent)'  },
+          { label: 'Employés',    val: users.filter(u => u.role === 'employee').length,               color: '#3B82F6'        },
+          { label: 'Encadrants',  val: users.filter(u => SUPERVISOR_ROLES.includes(u.role)).length,   color: '#8B5CF6'        },
+          { label: 'Actifs',      val: users.filter(u => u.is_active).length,                         color: 'var(--success)' },
         ].map(s => (
           <div key={s.label} className="stat-card">
             <div className="stat-label">{s.label}</div>
@@ -114,21 +130,18 @@ export default function Users() {
         ))}
       </div>
 
-      {/* Toolbar */}
-      <div style={{ display: 'flex', gap: 10, marginBottom: '1rem', alignItems: 'center' }}>
-        <input
-          className="form-control"
-          placeholder="🔍 Rechercher un utilisateur..."
-          value={search}
-          onChange={e => setSearch(e.target.value)}
-          style={{ maxWidth: 300 }}
-        />
-        <button className="btn btn-navy" onClick={() => { setShowAdd(true); setMsg(null) }}>
+      <div style={{ display: 'flex', gap: 10, marginBottom: '1rem', alignItems: 'center', flexWrap: 'wrap' }}>
+        <input className="form-control" placeholder="🔍 Nom, email ou projet..." value={search}
+          onChange={e => setSearch(e.target.value)} style={{ maxWidth: 280 }} />
+        <select className="form-control" value={roleFilter} onChange={e => setRoleFilter(e.target.value)} style={{ maxWidth: 200 }}>
+          <option value="all">Tous les rôles</option>
+          {Object.entries(ROLE_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+        </select>
+        <button className="btn btn-navy" style={{ marginLeft: 'auto' }} onClick={() => { setShowAdd(true); setFormMsg(null) }}>
           + Ajouter un utilisateur
         </button>
       </div>
 
-      {/* Tableau */}
       <div className="card">
         <div className="card-title">Liste des utilisateurs ({filtered.length})</div>
         <table>
@@ -137,8 +150,8 @@ export default function Users() {
               <th>Utilisateur</th>
               <th>Email</th>
               <th>Rôle</th>
-              <th>Project</th>
-              <th>Manager</th>
+              <th>Projet</th>
+              <th>Superviseur</th>
               <th>Statut</th>
               <th>Actions</th>
             </tr>
@@ -147,48 +160,34 @@ export default function Users() {
             {filtered.map((u: any) => {
               const initials = `${u.first_name?.[0] || ''}${u.last_name?.[0] || ''}`.toUpperCase()
               const color = ROLE_COLORS[u.role] || '#64748B'
+              const locked = u.role === 'admin' && me?.role !== 'admin'
               return (
-                <tr key={u.id}>
+                <tr key={u.id} style={{ opacity: u.is_active ? 1 : .55 }}>
                   <td>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                      <div style={{
-                        width: 34, height: 34, borderRadius: '50%',
-                        background: color + '20', color, display: 'flex',
-                        alignItems: 'center', justifyContent: 'center',
-                        fontWeight: 700, fontSize: '.72rem', flexShrink: 0
-                      }}>
+                      <div style={{ width: 34, height: 34, borderRadius: '50%', background: color + '20', color, display: 'flex',
+                        alignItems: 'center', justifyContent: 'center', fontWeight: 700, fontSize: '.72rem', flexShrink: 0 }}>
                         {initials}
                       </div>
                       <div>
-                        <div style={{ fontWeight: 600, fontSize: '.85rem' }}>
-                          {u.first_name} {u.last_name}
-                        </div>
-                        <div style={{ fontSize: '.7rem', color: 'var(--muted)' }}>
-                          Depuis {u.hire_date ? new Date(u.hire_date).toLocaleDateString('fr-FR') : '—'}
-                        </div>
+                        <div style={{ fontWeight: 600, fontSize: '.85rem' }}>{u.first_name} {u.last_name}</div>
+                        <div style={{ fontSize: '.7rem', color: 'var(--muted)' }}>Embauche : {fmtDate(u.hire_date)}</div>
                       </div>
                     </div>
                   </td>
                   <td style={{ fontSize: '.82rem' }}>{u.email}</td>
                   <td>
-                    <span className="badge" style={{ background: color + '20', color }}>
-                      {ROLES[u.role] || u.role}
-                    </span>
+                    <span className="badge" style={{ background: color + '20', color }}>{ROLE_LABELS[u.role] || u.role}</span>
                   </td>
+                  <td style={{ fontSize: '.82rem', color: 'var(--muted)' }}>{u.project || '—'}</td>
                   <td style={{ fontSize: '.82rem', color: 'var(--muted)' }}>
-                    {u.department || '—'}
-                  </td>
-                  <td style={{ fontSize: '.82rem', color: 'var(--muted)' }}>
-                    {u.role === 'employee' ? (
-                      <select
-                        className="form-control"
-                        value={u.manager_id || ''}
+                    {SHOULD_HAVE_SUPERVISOR.includes(u.role) ? (
+                      <select className="form-control" value={u.manager_id || ''}
                         onChange={e => assignManager(u.id, e.target.value)}
-                        style={{ minWidth: 170, padding: '5px 8px' }}
-                      >
+                        style={{ minWidth: 170, padding: '5px 8px', borderColor: u.manager_id ? undefined : 'var(--warn)' }}>
                         <option value="" disabled>Choisir un superviseur</option>
-                        {managers.map(m => (
-                          <option key={m.id} value={m.id}>{m.first_name} {m.last_name}</option>
+                        {supervisors.filter(m => m.id !== u.id).map(m => (
+                          <option key={m.id} value={m.id}>{m.first_name} {m.last_name} ({ROLE_LABELS[m.role]})</option>
                         ))}
                       </select>
                     ) : (u.manager_name || '—')}
@@ -199,12 +198,13 @@ export default function Users() {
                     </span>
                   </td>
                   <td>
-                    <button
-                      className={`btn btn-sm ${u.is_active ? 'btn-outline' : 'btn-green'}`}
-                      onClick={() => toggleActive(u.id, u.is_active)}
-                    >
-                      {u.is_active ? 'Désactiver' : 'Activer'}
-                    </button>
+                    {u.id === me?.id ? <span className="form-hint">Vous</span> : (
+                      <button className={`btn btn-sm ${u.is_active ? 'btn-outline' : 'btn-green'}`}
+                        disabled={locked} title={locked ? 'Réservé au super administrateur' : ''}
+                        onClick={() => toggleActive(u)}>
+                        {u.is_active ? 'Désactiver' : 'Activer'}
+                      </button>
+                    )}
                   </td>
                 </tr>
               )
@@ -213,52 +213,40 @@ export default function Users() {
         </table>
       </div>
 
-      {/* Modal ajout */}
       {showAdd && (
-        <div
-          style={{
-            position: 'fixed', inset: 0, background: 'rgba(0,0,0,.45)',
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-            zIndex: 1000, padding: '1rem'
-          }}
-          onClick={e => { if (e.target === e.currentTarget) setShowAdd(false) }}
-        >
-          <div className="card" style={{ width: '100%', maxWidth: 520, maxHeight: '90vh', overflowY: 'auto' }}>
+        <div className="modal-backdrop" onClick={e => { if (e.target === e.currentTarget) setShowAdd(false) }}>
+          <div className="card" style={{ width: '100%', maxWidth: 540, maxHeight: '90vh', overflowY: 'auto' }}>
             <div style={{ fontWeight: 700, fontSize: '1.1rem', color: 'var(--navy)', marginBottom: '1.25rem' }}>
               👤 Nouvel utilisateur
             </div>
 
-            {msg && <div className={`alert alert-${msg.type}`}>{msg.text}</div>}
+            {formMsg && <div className="alert alert-danger">❌ {formMsg}</div>}
 
             <form onSubmit={handleAdd}>
               <div className="form-row">
                 <div className="form-group">
                   <label className="form-label">Prénom *</label>
                   <input className="form-control" value={form.first_name}
-                    onChange={e => setForm({ ...form, first_name: e.target.value })}
-                    placeholder="Sophie" required />
+                    onChange={e => setForm({ ...form, first_name: e.target.value })} placeholder="Aya" required />
                 </div>
                 <div className="form-group">
                   <label className="form-label">Nom *</label>
                   <input className="form-control" value={form.last_name}
-                    onChange={e => setForm({ ...form, last_name: e.target.value })}
-                    placeholder="Martin" required />
+                    onChange={e => setForm({ ...form, last_name: e.target.value })} placeholder="KOUASSI" required />
                 </div>
               </div>
 
-              <div className="form-group">
-                <label className="form-label">Email *</label>
-                <input className="form-control" type="email" value={form.email}
-                  onChange={e => setForm({ ...form, email: e.target.value })}
-                  placeholder="sophie.martin@congipro.fr" required />
-              </div>
-
-              <div className="form-group">
-                <label className="form-label">Mot de passe *</label>
-                <input className="form-control" type="password" value={form.password}
-                  onChange={e => setForm({ ...form, password: e.target.value })}
-                  placeholder="Minimum 8 caractères" required />
-                <div className="form-hint">Minimum 8 caractères</div>
+              <div className="form-row">
+                <div className="form-group">
+                  <label className="form-label">Email *</label>
+                  <input className="form-control" type="email" value={form.email}
+                    onChange={e => setForm({ ...form, email: e.target.value })} placeholder="prenom.nom@ecogec.ci" required />
+                </div>
+                <div className="form-group">
+                  <label className="form-label">Mot de passe provisoire *</label>
+                  <input className="form-control" type="password" value={form.password}
+                    onChange={e => setForm({ ...form, password: e.target.value })} placeholder="8 caractères minimum" required />
+                </div>
               </div>
 
               <div className="form-row">
@@ -268,28 +256,43 @@ export default function Users() {
                     onChange={e => setForm({ ...form, role: e.target.value })}>
                     <option value="employee">Employé</option>
                     <option value="manager">Manager</option>
-                    <option value="rh">RH / Admin</option>
+                    <option value="rh">Ressources humaines</option>
+                    <option value="director">Directeur exécutif</option>
+                    {me?.role === 'admin' && <option value="admin">Super administrateur</option>}
                   </select>
                 </div>
                 <div className="form-group">
-                    <label className="form-label">Superviseur *</label>
+                  <label className="form-label">Superviseur {NEEDS_SUPERVISOR.includes(form.role) ? '*' : '(facultatif)'}</label>
                   <select className="form-control" value={form.manager_id}
                     onChange={e => setForm({ ...form, manager_id: e.target.value })}>
-                    <option value="" disabled>Choisir un superviseur</option>
-                    {managers.map(m => (
-                      <option key={m.id} value={m.id}>
-                        {m.first_name} {m.last_name}
-                      </option>
+                    <option value="">— Aucun —</option>
+                    {supervisors.map(m => (
+                      <option key={m.id} value={m.id}>{m.first_name} {m.last_name} ({ROLE_LABELS[m.role]})</option>
                     ))}
                   </select>
+                  <div className="form-hint">Valide les demandes de congé (étape 1)</div>
+                </div>
+              </div>
+
+              <div className="form-row">
+                <div className="form-group">
+                  <label className="form-label">Projet</label>
+                  <select className="form-control" value={form.project_id}
+                    onChange={e => setForm({ ...form, project_id: e.target.value })}>
+                    <option value="">— Aucun —</option>
+                    {projects.map(p => <option key={p.id} value={p.id}>{p.name} ({p.code})</option>)}
+                  </select>
+                </div>
+                <div className="form-group">
+                  <label className="form-label">Date d'embauche</label>
+                  <input className="form-control" type="date" value={form.hire_date}
+                    onChange={e => setForm({ ...form, hire_date: e.target.value })} />
+                  <div className="form-hint">Par défaut : aujourd'hui</div>
                 </div>
               </div>
 
               <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: '1rem' }}>
-                <button type="button" className="btn btn-outline"
-                  onClick={() => { setShowAdd(false); setMsg(null) }}>
-                  Annuler
-                </button>
+                <button type="button" className="btn btn-outline" onClick={() => setShowAdd(false)}>Annuler</button>
                 <button type="submit" className="btn btn-navy" disabled={saving}>
                   {saving ? 'Création...' : 'Créer l\'utilisateur'}
                 </button>

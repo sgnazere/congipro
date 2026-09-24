@@ -67,7 +67,7 @@ export default function LeaveTypes() {
         <div className="stat-card">
           <div className="stat-label">Avec validation</div>
           <div className="stat-val" style={{ color: 'var(--success)' }}>
-            {types.filter(t => t.requires_approval).length}
+            {types.filter(t => t.requires_approval && t.approval_levels > 0).length}
           </div>
         </div>
         <div className="stat-card">
@@ -102,7 +102,7 @@ export default function LeaveTypes() {
             <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
               {[
                 { label: 'Max / an',         val: `${t.max_days_per_year} jours` },
-                { label: 'Niveaux validation', val: t.approval_levels === 0 ? 'Aucun' : `${t.approval_levels} niveau(x)` },
+                { label: 'Validation', val: !t.requires_approval || t.approval_levels === 0 ? 'Automatique' : t.approval_levels === 1 ? 'Superviseur' : 'Superviseur + RH' },
                 { label: 'Justificatif',     val: t.requires_document ? 'Oui' : 'Non' },
               ].map(row => (
                 <div key={row.label} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '.8rem' }}>
@@ -114,7 +114,7 @@ export default function LeaveTypes() {
 
             <div style={{ display: 'flex', gap: 6, marginTop: 12 }}>
               <span className={`badge ${t.requires_approval ? 'badge-approved' : 'badge-cancelled'}`}>
-                {t.requires_approval ? 'Validation requise' : 'Libre'}
+                {t.requires_approval && t.approval_levels > 0 ? 'Validation requise' : 'Enregistrement direct'}
               </span>
               <span className={`badge ${t.is_active ? 'badge-approved' : 'badge-rejected'}`}>
                 {t.is_active ? 'Actif' : 'Inactif'}
@@ -135,7 +135,7 @@ export default function LeaveTypes() {
       {/* Modal ajout */}
       {showAdd && (
         <div
-          style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.45)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: '1rem' }}
+          className="modal-backdrop"
           onClick={e => { if (e.target === e.currentTarget) setShowAdd(false) }}
         >
           <div className="card" style={{ width: '100%', maxWidth: 480 }}>
@@ -181,7 +181,7 @@ export default function LeaveTypes() {
                   <label className="form-label">Niveaux validation</label>
                   <select className="form-control" value={form.approval_levels}
                     onChange={e => setForm({ ...form, approval_levels: parseInt(e.target.value) })}>
-                    <option value={0}>Aucun (automatique)</option>
+                    <option value={0}>Aucune (enregistrement direct)</option>
                     <option value={1}>1 — Manager</option>
                     <option value={2}>2 — Manager + RH</option>
                   </select>
@@ -190,16 +190,10 @@ export default function LeaveTypes() {
 
               <div style={{ display: 'flex', gap: 16, marginBottom: '1rem' }}>
                 <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: '.83rem', cursor: 'pointer' }}>
-                  <input type="checkbox" checked={form.requires_approval}
-                    onChange={e => setForm({ ...form, requires_approval: e.target.checked })}
-                    style={{ width: 'auto' }} />
-                  Validation requise
-                </label>
-                <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: '.83rem', cursor: 'pointer' }}>
                   <input type="checkbox" checked={form.requires_document}
                     onChange={e => setForm({ ...form, requires_document: e.target.checked })}
                     style={{ width: 'auto' }} />
-                  Justificatif obligatoire
+                  Justificatif obligatoire (PDF/image joint à la demande)
                 </label>
               </div>
 

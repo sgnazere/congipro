@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import api from '../api/axios'
+import { fmtDate } from '../utils/dates'
 
 const MONTHS = [
   'Janvier','Février','Mars','Avril','Mai','Juin',
@@ -44,9 +45,7 @@ export default function Calendar() {
 
   const getInfo = (d: number) => {
     const ds = dateStr(d)
-    const holiday = holidays.find(h => {
-      return new Date(h.date).toISOString().slice(0, 10) === ds
-    })
+    const holiday = holidays.find(h => h.date.slice(0, 10) === ds)
     const dayRequests = requests.filter(r => {
       const start = r.start_date?.slice(0, 10)
       const end   = r.end_date?.slice(0, 10)
@@ -247,10 +246,14 @@ export default function Calendar() {
             {Array.from({ length: daysInMonth }, (_, i) => i + 1)
               .filter(d => !isWeekend(d)).length}
           </strong> jours ouvrés</span>
-          <span>🏖️ <strong>{holidays.length}</strong> jour(s) férié(s)</span>
+          <span>🏖️ <strong>
+            {holidays.filter(h => h.date.slice(0, 7) === `${year}-${pad(month + 1)}`).length}
+          </strong> jour(s) férié(s) ce mois</span>
           <span>✅ <strong>
-            {requests.filter(r => r.status === 'approved').length}
-          </strong> absence(s) approuvée(s)</span>
+            {requests.filter(r => r.status === 'approved'
+              && r.start_date.slice(0, 7) <= `${year}-${pad(month + 1)}`
+              && r.end_date.slice(0, 7) >= `${year}-${pad(month + 1)}`).length}
+          </strong> absence(s) approuvée(s) ce mois</span>
         </div>
       </div>
 
@@ -293,12 +296,10 @@ export default function Calendar() {
                   }}>
                     <div style={{ fontWeight: 600, fontSize: '.85rem' }}>{r.user_name}</div>
                     <div style={{ fontSize: '.78rem', color: 'var(--muted)', marginTop: 2 }}>
-                      {r.type_label} · {r.days_count} jour(s) ouvré(s)
+                      {r.type_label} · {parseFloat(r.days_count)} jour(s) ouvré(s)
                     </div>
                     <div style={{ fontSize: '.75rem', color: 'var(--muted)', marginTop: 2 }}>
-                      Du {new Date(r.start_date).toLocaleDateString('fr-FR')}
-                      {' au '}
-                      {new Date(r.end_date).toLocaleDateString('fr-FR')}
+                      Du {fmtDate(r.start_date)} au {fmtDate(r.end_date)}
                     </div>
                     <div style={{ marginTop: 6 }}>
                       <span className={`badge badge-${r.status}`} style={{ fontSize: '.68rem' }}>

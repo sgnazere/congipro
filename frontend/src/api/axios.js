@@ -1,7 +1,8 @@
 import axios from 'axios';
+import { API_URL } from '../config';
 
 const api = axios.create({
-  baseURL: 'http://localhost:3001/api',
+  baseURL: API_URL,
   headers: { 'Content-Type': 'application/json' },
 });
 
@@ -105,6 +106,21 @@ if (typeof window !== 'undefined') {
   window.addEventListener('storage', (event) => {
     if (event.key === 'ecogec:api-cache-invalidated') clearGetCache();
   });
+}
+
+// Télécharge (ou ouvre) un fichier protégé par le token : un simple lien <a> n'enverrait pas l'en-tête Authorization
+export async function downloadFile(url, filename, { open = false } = {}) {
+  const res  = await rawGet(url, { responseType: 'blob' });
+  const href = URL.createObjectURL(res.data);
+  if (open) {
+    window.open(href, '_blank');
+  } else {
+    const a = document.createElement('a');
+    a.href = href;
+    a.download = filename;
+    a.click();
+  }
+  setTimeout(() => URL.revokeObjectURL(href), 60000);
 }
 
 export default api;

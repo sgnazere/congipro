@@ -1,9 +1,12 @@
 import pdfMake from 'pdfmake/build/pdfmake'
 import pdfFonts from 'pdfmake/build/vfs_fonts'
+import { parseDay } from './dates'
 
 pdfMake.addVirtualFileSystem(pdfFonts)
 
 export interface LeaveRequestPDF {
+  reference:      string
+  leave_type:     string
   employee_name:  string
   project_name:   string
   days_count:     number
@@ -22,14 +25,15 @@ export function generateLeavePDF(data: LeaveRequestPDF) {
     day: '2-digit', month: 'long', year: 'numeric'
   })
 
-  const fmtDate = (d: string) => new Date(d).toLocaleDateString('fr-FR', {
+  const fmtDate = (d: string) => parseDay(d).toLocaleDateString('fr-FR', {
     weekday: 'long', day: '2-digit', month: 'long', year: 'numeric'
   })
 
   const statusFr: Record<string, string> = {
-    approved: 'Approuvée ✓',
+    approved: 'Approuvée',
     pending:  'En attente de validation',
     rejected: 'Rejetée',
+    cancelled: 'Annulée',
   }
 
   const docDefinition: any = {
@@ -50,7 +54,7 @@ export function generateLeavePDF(data: LeaveRequestPDF) {
           {
             stack: [
               { text: 'DEMANDE DE CONGÉ', style: 'docTitle' },
-              { text: `Réf : DCA-${Date.now().toString().slice(-6)}`, style: 'ref' },
+              { text: `Réf : DCA-${data.reference.slice(0, 8).toUpperCase()}`, style: 'ref' },
             ],
             alignment: 'right',
           }
@@ -82,6 +86,7 @@ export function generateLeavePDF(data: LeaveRequestPDF) {
         table: {
           widths: ['35%', '65%'],
           body: [
+            [{ text: 'Type de congé', style: 'tableLabel' }, { text: data.leave_type, style: 'tableValueBold' }],
             [{ text: 'Nombre de jours ouvrés', style: 'tableLabel' }, { text: `${data.days_count} jour(s) ouvré(s)`, style: 'tableValueBold' }],
             [{ text: 'Date de début', style: 'tableLabel' }, { text: fmtDate(data.start_date), style: 'tableValue' }],
             [{ text: 'Date de fin', style: 'tableLabel' }, { text: fmtDate(data.end_date), style: 'tableValue' }],
@@ -149,18 +154,23 @@ export function generateLeavePDF(data: LeaveRequestPDF) {
             alignment: 'right',
           },
         ],
-        marginBottom: 40,
-      },
-
-      // ── PIED DE PAGE ─────────────────────────────────────
-      { canvas: [{ type: 'line', x1: 0, y1: 0, x2: 495, y2: 0, lineWidth: 0.5, lineColor: '#CBD5E1' }], marginBottom: 10 },
-      {
-        columns: [
-          { text: `Fait à ${data.city || 'Abidjan'}, le ${today}`, style: 'footer' },
-          { text: 'EcoGec — Document officiel', style: 'footer', alignment: 'right' },
-        ]
       },
     ],
+
+    // ── PIED DE PAGE ─────────────────────────────────────────
+    // Dans la marge basse : le formulaire tient sur une seule page A4
+    footer: () => ({
+      margin: [50, 10, 50, 0],
+      stack: [
+        { canvas: [{ type: 'line', x1: 0, y1: 0, x2: 495, y2: 0, lineWidth: 0.5, lineColor: '#CBD5E1' }], marginBottom: 6 },
+        {
+          columns: [
+            { text: `Fait à ${data.city || 'Abidjan'}, le ${today}`, style: 'footer' },
+            { text: 'EcoGec — Document officiel', style: 'footer', alignment: 'right' },
+          ]
+        },
+      ],
+    }),
 
     // ── STYLES ───────────────────────────────────────────────
     styles: {
@@ -233,10 +243,10 @@ export function generateLeavePDF(data: LeaveRequestPDF) {
 
 // Calcul date de retour (prochain jour ouvré après la fin)
 export function calcReturnDate(endDate: string): string {
-  const d = new Date(endDate)
-  d.setDate(d.getDate() + 1)
-  while (d.getDay() === 0 || d.getDay() === 6) {
-    d.setDate(d.getDate() + 1)
+  const d = new Date(endDate.slice(0, 10) + 'T00:00:00Z')
+  d.setUTCDate(d.getUTCDate() + 1)
+  while (d.getUTCDay() === 0 || d.getUTCDay() === 6) {
+    d.setUTCDate(d.getUTCDate() + 1)
   }
   return d.toISOString().slice(0, 10)
 }

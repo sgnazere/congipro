@@ -1,5 +1,8 @@
 import { useEffect, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import api from '../api/axios'
+import useAuthStore from '../store/authStore'
+import { canAccess, refreshCounters } from '../navigation'
 
 const NOTIF_ICONS: Record<string, string> = {
   request_submitted: '📬',
@@ -10,6 +13,8 @@ const NOTIF_ICONS: Record<string, string> = {
 }
 
 export default function Notifications() {
+  const navigate = useNavigate()
+  const { user } = useAuthStore()
   const [notifs,  setNotifs]  = useState<any[]>([])
   const [loading, setLoading] = useState(true)
 
@@ -27,15 +32,26 @@ export default function Notifications() {
 
   useEffect(() => { load() }, [])
 
-  const markRead = async (id: string) => {
-    await api.patch(`/notifications/${id}/read`)
-    setNotifs(ns => ns.map(n => n.id === id ? { ...n, is_read: true } : n))
+  // Page liée à la notification : à valider → Validation ; sinon → Mes demandes
+  const targetOf = (n: any) => {
+    const path = n.type === 'request_submitted' ? '/validate' : n.request_id ? '/requests' : null
+    return path && canAccess(user?.role, path) ? path : null
+  }
+
+  const openNotif = async (n: any) => {
+    if (!n.is_read) {
+      await api.patch(`/notifications/${n.id}/read`)
+      setNotifs(ns => ns.map(x => x.id === n.id ? { ...x, is_read: true } : x))
+      refreshCounters()
+    }
+    const target = targetOf(n)
+    if (target) navigate(target)
   }
 
   const markAllRead = async () => {
-    const unread = notifs.filter(n => !n.is_read)
-    await Promise.all(unread.map(n => api.patch(`/notifications/${n.id}/read`)))
+    await api.patch('/notifications/read-all')
     setNotifs(ns => ns.map(n => ({ ...n, is_read: true })))
+    refreshCounters()
   }
 
   const unreadCount = notifs.filter(n => !n.is_read).length
@@ -75,9 +91,9 @@ export default function Notifications() {
                   background: n.is_read ? 'var(--light)' : '#EFF6FF',
                   border: n.is_read ? '1px solid var(--border)' : '1px solid #BFDBFE',
                   borderLeft: n.is_read ? '1px solid var(--border)' : '3px solid var(--accent)',
-                  cursor: n.is_read ? 'default' : 'pointer',
+                  cursor: !n.is_read || targetOf(n) ? 'pointer' : 'default',
                 }}
-                onClick={() => !n.is_read && markRead(n.id)}
+                onClick={() => openNotif(n)}
               >
                 <span style={{ fontSize: '1.2rem' }}>
                   {NOTIF_ICONS[n.type] || '🔔'}

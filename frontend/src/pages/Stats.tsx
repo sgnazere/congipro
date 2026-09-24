@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import api from '../api/axios'
+import api, { downloadFile } from '../api/axios'
 
 const MONTHS_FR = ['Jan','Fév','Mar','Avr','Mai','Jun','Jul','Aoû','Sep','Oct','Nov','Déc']
 
@@ -7,6 +7,13 @@ export default function Stats() {
   const [stats,   setStats]   = useState<any>(null)
   const [loading, setLoading] = useState(true)
   const [year,    setYear]    = useState(new Date().getFullYear())
+  const [exporting, setExporting] = useState(false)
+
+  const exportCsv = async () => {
+    setExporting(true)
+    try { await downloadFile(`/stats/export?year=${year}`, `ecogec_absences_${year}.csv`) }
+    finally { setExporting(false) }
+  }
 
   useEffect(() => {
     const load = async () => {
@@ -39,9 +46,18 @@ export default function Stats() {
     <div>
       {/* Sélecteur année */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: '1.25rem' }}>
-        <button className="btn btn-outline btn-sm" onClick={() => setYear(y => y - 1)}>◀</button>
+        <button className="btn btn-outline btn-sm no-print" onClick={() => setYear(y => y - 1)}>◀</button>
         <span style={{ fontWeight: 700, fontSize: '1rem' }}>Année {year}</span>
-        <button className="btn btn-outline btn-sm" onClick={() => setYear(y => y + 1)}>▶</button>
+        <button className="btn btn-outline btn-sm no-print" onClick={() => setYear(y => y + 1)}>▶</button>
+        <div className="no-print" style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+          <button className="btn btn-sm btn-outline" onClick={exportCsv} disabled={exporting}
+            title="Toutes les demandes de l'année, une ligne par demande">
+            {exporting ? 'Export…' : '📊 Export Excel (CSV)'}
+          </button>
+          <button className="btn btn-sm btn-outline" onClick={() => window.print()} title="Imprimer ou enregistrer en PDF">
+            📄 Export PDF
+          </button>
+        </div>
       </div>
 
       {/* KPIs */}
@@ -123,14 +139,6 @@ export default function Stats() {
       <div className="card">
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1rem' }}>
           <div className="card-title" style={{ margin: 0 }}>Top absences par employé</div>
-          <div style={{ display: 'flex', gap: 8 }}>
-            <button className="btn btn-sm btn-outline" onClick={() => alert('Export Excel — intégrer exceljs')}>
-              📊 Export Excel
-            </button>
-            <button className="btn btn-sm btn-outline" onClick={() => window.print()}>
-              📄 Export PDF
-            </button>
-          </div>
         </div>
 
         {stats.topUsers.length === 0 ? (

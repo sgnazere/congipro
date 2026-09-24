@@ -28,7 +28,7 @@ export default function Login() {
             <input
               className="form-control"
               type="email"
-              placeholder="admin@congipro.fr"
+              placeholder="prenom.nom@ecogec.ci"
               value={email}
               onChange={e => setEmail(e.target.value)}
               required

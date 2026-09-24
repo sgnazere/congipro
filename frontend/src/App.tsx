@@ -1,5 +1,5 @@
 import './index.css'
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom'
 import Login         from './pages/Login'
 import Dashboard     from './pages/Dashboard'
 import NewRequest    from './pages/NewRequest'
@@ -7,6 +7,7 @@ import Validate      from './pages/Validate'
 import Requests      from './pages/Requests'
 import Notifications from './pages/Notifications'
 import Calendar      from './pages/Calendar'
+import Team          from './pages/Team'
 import Users         from './pages/Users'
 import LeaveTypes    from './pages/LeaveTypes'
 import Holidays      from './pages/Holidays'
@@ -16,14 +17,15 @@ import Projects      from './pages/Projects'
 import AdminPanel    from './pages/AdminPanel'
 import Layout        from './components/Layout'
 import useAuthStore  from './store/authStore'
+import { canAccess } from './navigation'
 
-function PrivateRoute({ children }: { children: React.ReactNode }) {
-  const { user } = useAuthStore()
-  return user ? <>{children}</> : <Navigate to="/login" replace />
-}
-
+// Connecté ET rôle autorisé pour cette page ; sinon retour au tableau de bord
 function Page({ children }: { children: React.ReactNode }) {
-  return <PrivateRoute><Layout>{children}</Layout></PrivateRoute>
+  const { user } = useAuthStore()
+  const { pathname } = useLocation()
+  if (!user) return <Navigate to="/login" replace />
+  if (!canAccess(user.role, pathname)) return <Navigate to="/dashboard" replace />
+  return <Layout>{children}</Layout>
 }
 
 export default function App() {
@@ -37,6 +39,7 @@ export default function App() {
         <Route path="/requests"      element={<Page><Requests /></Page>} />
         <Route path="/notifications" element={<Page><Notifications /></Page>} />
         <Route path="/calendar"      element={<Page><Calendar /></Page>} />
+        <Route path="/team"          element={<Page><Team /></Page>} />
         <Route path="/users"         element={<Page><Users /></Page>} />
         <Route path="/projects"      element={<Page><Projects /></Page>} />
         <Route path="/leave-types"   element={<Page><LeaveTypes /></Page>} />

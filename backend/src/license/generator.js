@@ -7,7 +7,13 @@ const fs       = require('fs');
 const path     = require('path');
 const readline = require('readline');
 
-const MASTER_KEY = process.env.LICENSE_MASTER_KEY; // [valeur retirée avant publication]
+// Clé maîtresse lue uniquement depuis l'environnement : jamais dans le code source
+require('dotenv').config({ path: path.join(__dirname, '../../.env') });
+const MASTER_KEY = process.env.LICENSE_MASTER_KEY;
+if (!MASTER_KEY) {
+  console.error('❌ LICENSE_MASTER_KEY absente : renseignez-la dans backend/.env');
+  process.exit(1);
+}
 
 // ── GÉNÉRER CODE LISIBLE ─────────────────────────────────────
 function generateLicenseCode(clientName, expiresAt) {
