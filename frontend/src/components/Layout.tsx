@@ -16,12 +16,14 @@ export default function Layout({ children }: { children: React.ReactNode }) {
 
   const loadCounters = useCallback(async () => {
     try {
-      const [n, v] = await Promise.all([
+      const [n, v, r] = await Promise.all([
         api.get('/notifications/unread-count'),
         hasValidation ? api.get('/requests/to-validate') : Promise.resolve({ data: [] }),
+        hasValidation ? api.get('/returns/to-process') : Promise.resolve({ data: [] }),
       ])
       setUnread(n.data.count)
-      setToValidate(v.data.length)
+      // Demandes à valider + retours de congé à confirmer / régulariser
+      setToValidate(v.data.length + r.data.length)
     } catch { /* compteurs non bloquants */ }
   }, [hasValidation])
 

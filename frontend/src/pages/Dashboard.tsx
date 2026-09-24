@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import api from '../api/axios'
 import useAuthStore from '../store/authStore'
 import { canAccess } from '../navigation'
-import { fmtDate, STATUS_FR } from '../utils/dates'
+import { fmtDate, STATUS_FR, awaitingReturn, todayIso } from '../utils/dates'
 
 export default function Dashboard() {
   const navigate = useNavigate()
@@ -12,6 +12,7 @@ export default function Dashboard() {
   const [mine,       setMine]       = useState<any[]>([])
   const [toValidate, setToValidate] = useState<any[]>([])
   const [orgPending, setOrgPending] = useState<number | null>(null)
+  const [returns,    setReturns]    = useState<any[]>([])
   const [loading,    setLoading]    = useState(true)
 
   const isValidator = canAccess(user?.role, '/validate')
@@ -20,12 +21,14 @@ export default function Dashboard() {
   useEffect(() => {
     const load = async () => {
       try {
-        const [b, r, v, o] = await Promise.all([
+        const [b, r, v, o, rt] = await Promise.all([
           api.get('/balances/me'),
           api.get('/requests/all'),
           isValidator ? api.get('/requests/to-validate') : Promise.resolve({ data: [] }),
           seesOrg ? api.get('/requests', { params: { status: 'pending' } }) : Promise.resolve({ data: null }),
+          isValidator ? api.get('/returns/to-process') : Promise.resolve({ data: [] }),
         ])
+        setReturns(rt.data)
         setBalances(b.data)
         setMine(r.data)
         setToValidate(v.data)
@@ -42,6 +45,7 @@ export default function Dashboard() {
   if (loading) return <div className="loader-wrap"><div className="loader"></div></div>
 
   const myPending = mine.filter(r => r.status === 'pending').length
+  const toDeclare = mine.filter(r => awaitingReturn(r) && r.planned_return_date?.slice(0, 10) <= todayIso())
   const next = mine
     .filter(r => r.status === 'approved' && r.end_date.slice(0, 10) >= new Date().toISOString().slice(0, 10))
     .sort((a, b) => a.start_date.localeCompare(b.start_date))[0]
@@ -53,14 +57,25 @@ export default function Dashboard() {
         {next && <span> Prochaine absence : <strong>{next.type_label}</strong> du {fmtDate(next.start_date)} au {fmtDate(next.end_date)}.</span>}
       </div>
 
+      {toDeclare.length > 0 && (
+        <div className="alert alert-warn" style={{ marginBottom: '1.25rem' }}>
+          <span style={{ flex: 1 }}>
+            ↩ Votre congé <strong>{toDeclare[0].type_label}</strong> s’est terminé le {fmtDate(toDeclare[0].end_date)} :
+            déclarez votre retour pour le clôturer.
+          </span>
+          <button className="btn btn-sm btn-green" onClick={() => navigate('/requests')}>Déclarer mon retour</button>
+        </div>
+      )}
+
       <div className="stat-grid">
         {isValidator && (
           <div className="stat-card" style={{ cursor: 'pointer', borderColor: toValidate.length ? 'var(--warn)' : undefined }}
             onClick={() => navigate('/validate')}>
-            <div className="stat-label">À valider</div>
-            <div className="stat-val" style={{ color: 'var(--warn)' }}>{toValidate.length}</div>
+            <div className="stat-label">À traiter</div>
+            <div className="stat-val" style={{ color: 'var(--warn)' }}>{toValidate.length + returns.length}</div>
             <div className="stat-sub">
-              {toValidate.length === 0 ? 'Rien en attente de votre décision' : 'Cliquer pour traiter →'}
+              {toValidate.length + returns.length === 0 ? 'Rien en attente de votre décision'
+                : `${toValidate.length} demande(s) · ${returns.length} retour(s) →`}
               {toValidate.some(r => r.is_emergency) && ' 🚨'}
             </div>
           </div>
@@ -128,7 +143,12 @@ export default function Dashboard() {
                   </td>
                   <td>{fmtDate(r.start_date)} → {fmtDate(r.end_date)}</td>
                   <td>{parseFloat(r.days_count)} j</td>
-                  <td><span className={`badge badge-${r.status}`}>{STATUS_FR[r.status] || r.status}</span></td>
+                  <td>
+                    {r.return_status === 'closed' ? <span className="badge badge-cancelled">✓ Clôturée</span>
+                      : r.return_status ? <span className="badge badge-pending">Retour en cours de traitement</span>
+                      : awaitingReturn(r) && r.planned_return_date?.slice(0, 10) <= todayIso() ? <span className="badge badge-pending">↩ Retour à déclarer</span>
+                      : <span className={`badge badge-${r.status}`}>{STATUS_FR[r.status] || r.status}</span>}
+                  </td>
                 </tr>
               ))}
             </tbody>

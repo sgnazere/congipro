@@ -34,7 +34,9 @@ export default function Notifications() {
 
   // Page liée à la notification : à valider → Validation ; sinon → Mes demandes
   const targetOf = (n: any) => {
-    const path = n.type === 'request_submitted' ? '/validate' : n.request_id ? '/requests' : null
+    // Relance adressée à l'employé (« Déclarez votre retour ») → ses demandes ; autres relances → Validation
+    const forValidator = n.type === 'request_submitted' || (n.type === 'reminder' && !n.title.startsWith('Déclarez'))
+    const path = forValidator ? '/validate' : n.request_id ? '/requests' : null
     return path && canAccess(user?.role, path) ? path : null
   }
 

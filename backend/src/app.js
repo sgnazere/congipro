@@ -377,11 +377,14 @@ app.get('/api/users/team', authenticate, authorize('manager', 'director', 'rh', 
       [req.user.id]
     );
     const leaves = await db.many(
-      `SELECT lr.id, lr.user_id, lr.start_date, lr.end_date, lr.days_count, lr.status,
+      `SELECT lr.id, lr.user_id, lr.start_date, lr.days_count, lr.status,
+              CASE WHEN ret.actual_return_date IS NOT NULL AND ret.actual_return_date - 1 < lr.end_date
+                   THEN (ret.actual_return_date - 1) ELSE lr.end_date END AS end_date,
               lt.label AS type_label, lt.color
        FROM leave_requests lr
        JOIN leave_types lt ON lr.leave_type_id = lt.id
        JOIN users u        ON lr.user_id = u.id
+       LEFT JOIN leave_returns ret ON ret.request_id = lr.id
        WHERE u.manager_id=$1 AND lr.status IN ('pending','approved')
          AND NOT (lr.end_date < $2 OR lr.start_date > $3)
        ORDER BY lr.start_date`,
@@ -617,12 +620,15 @@ const REQUEST_SELECT = `
          lt.label AS type_label, lt.color, lt.code AS type_code, lt.approval_levels,
          u.first_name||' '||u.last_name AS user_name,
          m.first_name||' '||m.last_name AS manager_name,
-         p.name AS department
+         p.name AS department,
+         add_business_days(lr.end_date, 1) AS planned_return_date,
+         ret.status AS return_status, ret.actual_return_date, ret.gap_days, ret.regularization
   FROM leave_requests lr
   JOIN leave_types lt  ON lr.leave_type_id = lt.id
   JOIN users u         ON lr.user_id = u.id
   LEFT JOIN users m    ON u.manager_id = m.id
-  LEFT JOIN projects p ON u.project_id = p.id`;
+  LEFT JOIN projects p ON u.project_id = p.id
+  LEFT JOIN leave_returns ret ON ret.request_id = lr.id`;
 
 // GET /api/requests — demandes visibles (calendrier, tableaux de bord)
 //  employee : les siennes · manager : les siennes + son équipe directe · rh/admin/director : toutes
@@ -899,6 +905,301 @@ app.delete('/api/requests/:id', authenticate, async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════
+//  RETOUR EFFECTIF (reprise de service)
+//  employé déclare → superviseur confirme → à l'heure/anticipé : clôture
+//  tardif : régularisation RH → clôture. Relances J+1 puis J+3 (RH).
+// ════════════════════════════════════════════════════════════
+
+const REGULARIZATIONS = {
+  deduire_conge: 'Jours de dépassement déduits du même congé',
+  sans_solde:    'Jours de dépassement en absence sans solde',
+  maladie:       'Jours de dépassement justifiés par un arrêt maladie',
+  injustifiee:   'Absence injustifiée',
+};
+const fmtFr = (iso) => iso.split('-').reverse().join('/');
+
+// Demande approuvée + retour éventuel + calculs de dates
+async function loadForReturn(requestId, actualReturnDate) {
+  return db.one(
+    `SELECT lr.*, u.manager_id AS requester_manager_id, u.first_name, u.last_name,
+            ret.status AS return_status, ret.gap_reason AS declared_reason, ret.declaration_comment,
+            add_business_days(lr.end_date, 1) AS planned_return_date,
+            CASE WHEN $2::date IS NULL THEN NULL
+                 ELSE business_days_between(lr.start_date, $2::date - 1) END AS actual_days
+     FROM leave_requests lr
+     JOIN users u ON u.id = lr.user_id
+     LEFT JOIN leave_returns ret ON ret.request_id = lr.id
+     WHERE lr.id = $1`,
+    [requestId, actualReturnDate || null]
+  );
+}
+
+// Contrôles communs sur la date de retour déclarée
+function checkReturnDate(r, date) {
+  if (!r) return [404, 'Demande introuvable'];
+  if (r.status !== 'approved') return [409, 'Seule une absence approuvée peut être clôturée'];
+  if (r.return_status === 'closed') return [409, 'Ce congé est déjà clôturé'];
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date || '')) return [400, 'Date de retour invalide'];
+  const today = new Date().toISOString().slice(0, 10);
+  if (date > today) return [422, 'La date de retour ne peut pas être dans le futur'];
+  if (date <= r.start_date) return [422, 'La date de retour doit être postérieure au début du congé'];
+  return null;
+}
+
+// Ajuste le solde du type/année quand les jours imputés diffèrent des jours demandés
+async function applyChargedDelta(r, chargedDays) {
+  const delta = parseFloat(chargedDays) - parseFloat(r.days_count);
+  if (delta === 0) return;
+  await db.run(
+    `UPDATE leave_balances SET used_days = used_days + $1, updated_at = NOW()
+     WHERE user_id=$2 AND leave_type_id=$3 AND year=EXTRACT(YEAR FROM $4::date)`,
+    [delta, r.user_id, r.leave_type_id, r.start_date]
+  );
+}
+
+// Confirmation (ou enregistrement direct) par le superviseur / RH / admin
+async function confirmReturn(req, r, date, reason, comment) {
+  const gap = parseFloat(r.actual_days) - parseFloat(r.days_count);
+  const late = gap > 0;
+  const closed = !late;
+  const charged = closed ? r.actual_days : null;
+  const declared = r.return_status === 'declared';
+  await db.run(
+    `INSERT INTO leave_returns (request_id, planned_return_date, actual_return_date, actual_days, gap_days, gap_reason,
+                                status, charged_days, declared_by, declared_at, confirmed_by, confirmed_at, confirmation_comment)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),$9,NOW(),$10)
+     ON CONFLICT (request_id) DO UPDATE SET
+       actual_return_date=$3, actual_days=$4, gap_days=$5, gap_reason=COALESCE($6, leave_returns.gap_reason),
+       status=$7, charged_days=$8, confirmed_by=$9, confirmed_at=NOW(), confirmation_comment=$10`,
+    [r.id, r.planned_return_date, date, r.actual_days, gap, reason || null,
+     closed ? 'closed' : 'to_regularize', charged, req.user.id, comment || null]
+  );
+  if (closed) await applyChargedDelta(r, charged);
+
+  const who = `${r.first_name} ${r.last_name}`;
+  if (closed) {
+    await notify(r.user_id, 'request_approved', '✓ Retour confirmé — congé clôturé',
+      `Retour du ${fmtFr(date)} confirmé.` + (gap < 0 ? ` ${-gap} jour(s) non pris rendu(s) à votre solde.` : ''), r.id);
+  } else {
+    await notify(r.user_id, 'system', 'Retour confirmé — dépassement transmis aux RH',
+      `Retour du ${fmtFr(date)} confirmé avec ${gap} jour(s) ouvré(s) de dépassement ; les RH vont régulariser.`, r.id);
+    await notifyRoles(['rh'], 'request_submitted', 'Retour tardif à régulariser',
+      `${who} : retour le ${fmtFr(date)} au lieu du ${fmtFr(r.planned_return_date)} (${gap} j de dépassement).`, r.id);
+  }
+  await audit(req.user.id, declared ? 'CONFIRM_RETURN' : 'RECORD_RETURN', 'leave_request', r.id, null,
+    { actual_return_date: date, gap_days: gap, status: closed ? 'closed' : 'to_regularize' }, req);
+  return { status: closed ? 'closed' : 'to_regularize', gap_days: gap, actual_days: parseFloat(r.actual_days) };
+}
+
+// POST /api/requests/:id/return — déclaration par l'employé, ou enregistrement par un valideur
+app.post('/api/requests/:id/return', authenticate, async (req, res) => {
+  try {
+    const { actual_return_date: date, reason, comment } = req.body;
+    const r = await loadForReturn(req.params.id, date);
+    const err = checkReturnDate(r, date);
+    if (err) return res.status(err[0]).json({ error: err[1] });
+
+    const gap = parseFloat(r.actual_days) - parseFloat(r.days_count);
+    if (gap !== 0 && !reason?.trim()) {
+      return res.status(400).json({ error: gap > 0 ? 'Indiquez le motif du retour tardif' : 'Indiquez le motif du retour anticipé' });
+    }
+
+    if (r.user_id !== req.user.id) {
+      // Enregistrement direct par le superviseur, un RH ou l'admin : vaut confirmation
+      const allowed = req.user.role === 'admin' || req.user.role === 'rh' || r.requester_manager_id === req.user.id;
+      if (!allowed) return res.status(403).json({ error: 'Accès refusé' });
+      return res.json(await confirmReturn(req, r, date, reason, comment));
+    }
+
+    if (r.return_status === 'to_regularize') return res.status(409).json({ error: 'Retour déjà confirmé, en cours de régularisation' });
+    await db.run(
+      `INSERT INTO leave_returns (request_id, planned_return_date, actual_return_date, actual_days, gap_days, gap_reason,
+                                  status, declared_by, declared_at, declaration_comment)
+       VALUES ($1,$2,$3,$4,$5,$6,'declared',$7,NOW(),$8)
+       ON CONFLICT (request_id) DO UPDATE SET actual_return_date=$3, actual_days=$4, gap_days=$5, gap_reason=$6,
+         declared_at=NOW(), declaration_comment=$8`,
+      [r.id, r.planned_return_date, date, r.actual_days, gap, reason || null, req.user.id, comment || null]
+    );
+    if (r.requester_manager_id) {
+      await notify(r.requester_manager_id, 'request_submitted', 'Retour de congé à confirmer',
+        `${r.first_name} ${r.last_name} déclare être de retour le ${fmtFr(date)}`
+        + (gap > 0 ? ` (${gap} j de dépassement)` : gap < 0 ? ` (retour anticipé de ${-gap} j)` : '') + '.', r.id);
+    }
+    await audit(req.user.id, 'DECLARE_RETURN', 'leave_request', r.id, null, { actual_return_date: date, gap_days: gap }, req);
+    res.json({ status: 'declared', gap_days: gap, actual_days: parseFloat(r.actual_days) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// PATCH /api/requests/:id/return/confirm — confirmation (date éventuellement corrigée)
+app.patch('/api/requests/:id/return/confirm', authenticate, authorize('manager', 'director', 'rh', 'admin'), async (req, res) => {
+  try {
+    const current = await db.one('SELECT actual_return_date FROM leave_returns WHERE request_id=$1', [req.params.id]);
+    const date = req.body.actual_return_date || current?.actual_return_date;
+    const r = await loadForReturn(req.params.id, date);
+    const err = checkReturnDate(r, date);
+    if (err) return res.status(err[0]).json({ error: err[1] });
+    if (r.user_id === req.user.id) return res.status(403).json({ error: 'Vous ne pouvez pas confirmer votre propre retour' });
+    const allowed = req.user.role === 'admin' || req.user.role === 'rh' || r.requester_manager_id === req.user.id;
+    if (!allowed) return res.status(403).json({ error: 'Vous n’êtes pas le superviseur de ce collaborateur' });
+    if (r.return_status === 'to_regularize') return res.status(409).json({ error: 'Retour déjà confirmé, en attente de régularisation RH' });
+
+    const gap = parseFloat(r.actual_days) - parseFloat(r.days_count);
+    const reason = req.body.reason?.trim() || r.declared_reason;
+    if (gap !== 0 && !reason) return res.status(400).json({ error: 'Indiquez le motif de l’écart' });
+    res.json(await confirmReturn(req, r, date, reason, req.body.comment));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// PATCH /api/requests/:id/return/regularize — décision RH sur un retour tardif
+app.patch('/api/requests/:id/return/regularize', authenticate, authorize('rh', 'admin'), async (req, res) => {
+  try {
+    const { regularization, comment } = req.body;
+    if (!REGULARIZATIONS[regularization]) return res.status(400).json({ error: 'Régularisation invalide' });
+    const r = await db.one(
+      `SELECT lr.*, u.manager_id AS requester_manager_id, u.first_name, u.last_name,
+              ret.status AS return_status, ret.actual_days, ret.gap_days, ret.actual_return_date
+       FROM leave_requests lr JOIN users u ON u.id=lr.user_id JOIN leave_returns ret ON ret.request_id=lr.id
+       WHERE lr.id=$1`, [req.params.id]);
+    if (!r) return res.status(404).json({ error: 'Retour introuvable' });
+    if (r.return_status !== 'to_regularize') return res.status(409).json({ error: 'Ce retour n’est pas en attente de régularisation' });
+    if (r.user_id === req.user.id) return res.status(403).json({ error: 'Vous ne pouvez pas régulariser votre propre retour' });
+
+    // Seule la déduction impute les jours de dépassement au solde du congé
+    const charged = regularization === 'deduire_conge' ? r.actual_days : r.days_count;
+    await db.run(
+      `UPDATE leave_returns SET status='closed', regularization=$2, charged_days=$3,
+         regularized_by=$4, regularized_at=NOW(), regularization_comment=$5 WHERE request_id=$1`,
+      [r.id, regularization, charged, req.user.id, comment || null]
+    );
+    await applyChargedDelta(r, charged);
+    const msg = `Retour du ${fmtFr(r.actual_return_date)} régularisé : ${REGULARIZATIONS[regularization].toLowerCase()}.`
+      + (comment ? ` ${comment}` : '');
+    await notify(r.user_id, 'system', 'Congé clôturé après régularisation', msg, r.id);
+    if (r.requester_manager_id) await notify(r.requester_manager_id, 'system', `Retour de ${r.first_name} ${r.last_name} régularisé`, msg, r.id);
+    await audit(req.user.id, 'REGULARIZE_RETURN', 'leave_request', r.id, null, { regularization, charged_days: charged }, req);
+    res.json({ status: 'closed', regularization, charged_days: parseFloat(charged) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// GET /api/requests/:id/return — détail du retour (suivi)
+app.get('/api/requests/:id/return', authenticate, async (req, res) => {
+  try {
+    const r = await db.one(
+      `SELECT ret.*, lr.user_id, u.manager_id,
+              d.first_name||' '||d.last_name AS declared_by_name,
+              c.first_name||' '||c.last_name AS confirmed_by_name,
+              g.first_name||' '||g.last_name AS regularized_by_name
+       FROM leave_returns ret JOIN leave_requests lr ON lr.id=ret.request_id JOIN users u ON u.id=lr.user_id
+       LEFT JOIN users d ON d.id=ret.declared_by LEFT JOIN users c ON c.id=ret.confirmed_by LEFT JOIN users g ON g.id=ret.regularized_by
+       WHERE ret.request_id=$1`, [req.params.id]);
+    if (!r) return res.json(null);
+    const allowed = r.user_id === req.user.id || r.manager_id === req.user.id || ['rh', 'admin', 'director'].includes(req.user.role);
+    if (!allowed) return res.status(403).json({ error: 'Accès refusé' });
+    res.json(r);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// GET /api/returns/to-process — retours à confirmer / enregistrer / régulariser par l'utilisateur connecté
+app.get('/api/returns/to-process', authenticate, async (req, res) => {
+  try {
+    if (req.user.role === 'employee') return res.json([]);
+    res.json(await db.many(
+      `SELECT lr.id, lr.user_id, lr.start_date, lr.end_date, lr.days_count, lr.return_reminder_level,
+              lt.label AS type_label, lt.color,
+              u.first_name||' '||u.last_name AS user_name, p.name AS department,
+              add_business_days(lr.end_date, 1) AS planned_return_date,
+              business_days_between(add_business_days(lr.end_date, 1), CURRENT_DATE - 1) AS overdue_days,
+              ret.status AS return_status, ret.actual_return_date, ret.actual_days, ret.gap_days, ret.gap_reason,
+              ret.declaration_comment, ret.confirmation_comment,
+              CASE WHEN ret.status = 'to_regularize' THEN 'regularize'
+                   WHEN ret.status = 'declared'      THEN 'confirm'
+                   ELSE 'record' END AS action
+       FROM leave_requests lr
+       JOIN users u        ON u.id = lr.user_id
+       JOIN leave_types lt ON lt.id = lr.leave_type_id
+       LEFT JOIN projects p ON p.id = u.project_id
+       LEFT JOIN leave_returns ret ON ret.request_id = lr.id
+       WHERE lr.status = 'approved' AND lr.user_id <> $1
+         AND ( (ret.status = 'to_regularize' AND $2 IN ('rh', 'admin'))
+            OR ((ret.status = 'declared' OR (ret.request_id IS NULL AND add_business_days(lr.end_date, 1) <= CURRENT_DATE))
+                AND ($2 = 'admin' OR u.manager_id = $1)) )
+       ORDER BY (ret.status = 'to_regularize') DESC, (ret.status = 'declared') DESC, lr.end_date`,
+      [req.user.id, req.user.role]
+    ));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// ── Relances : J+1 ouvré après le retour prévu → employé + superviseur ; J+3 → RH ──
+async function runReturnReminders() {
+  const rows = await db.many(
+    `SELECT lr.id, lr.user_id, lr.return_reminder_level AS level, u.manager_id, u.first_name, u.last_name,
+            add_business_days(lr.end_date, 1) AS planned, ret.status AS return_status,
+            CASE WHEN add_business_days(lr.end_date, 4) <= CURRENT_DATE THEN 2 ELSE 1 END AS target
+     FROM leave_requests lr
+     JOIN users u ON u.id = lr.user_id
+     LEFT JOIN leave_returns ret ON ret.request_id = lr.id
+     WHERE lr.status = 'approved' AND lr.return_reminder_level < 2
+       AND (ret.request_id IS NULL OR ret.status = 'declared')
+       AND add_business_days(lr.end_date, 2) <= CURRENT_DATE`
+  );
+  let sent = 0;
+  for (const r of rows) {
+    if (r.target <= r.level) continue;
+    const who = `${r.first_name} ${r.last_name}`;
+    const planned = fmtFr(r.planned);
+    // Niveau 1 envoyé même si l'on passe directement au niveau 2 (premier passage tardif)
+    if (r.level < 1) {
+      if (!r.return_status) {
+        await notify(r.user_id, 'reminder', 'Déclarez votre retour de congé',
+          `Votre retour était prévu le ${planned}. Déclarez-le dans « Mes demandes » (bouton ↩).`, r.id);
+      }
+      if (r.manager_id) {
+        await notify(r.manager_id, 'reminder', r.return_status ? `Retour de ${who} à confirmer` : `Retour de ${who} non déclaré`,
+          `Retour prévu le ${planned}. Confirmez ou enregistrez-le dans « Validation › Retours ».`, r.id);
+      }
+    }
+    if (r.target === 2) {
+      await notifyRoles(['rh'], 'reminder', `Retour non confirmé : ${who}`,
+        `Retour prévu le ${planned}, toujours pas ${r.return_status ? 'confirmé' : 'déclaré'} après 3 jours ouvrés : absence à clarifier.`, r.id);
+      if (r.manager_id) {
+        await notify(r.manager_id, 'reminder', `Relance : retour de ${who}`,
+          `Retour prévu le ${planned} toujours en suspens ; les RH ont été alertés.`, r.id);
+      }
+    }
+    await db.run('UPDATE leave_requests SET return_reminder_level=$1 WHERE id=$2', [r.target, r.id]);
+    await audit(null, 'RETURN_REMINDER', 'leave_request', r.id, null, { level: r.target }, null);
+    sent++;
+  }
+  return sent;
+}
+
+// POST /api/returns/run-reminders — lancement manuel (RH / admin)
+app.post('/api/returns/run-reminders', authenticate, authorize('rh', 'admin'), async (req, res) => {
+  try {
+    const sent = await runReturnReminders();
+    res.json({ ok: true, message: `${sent} relance(s) envoyée(s).` });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// ════════════════════════════════════════════════════════════
 //  TYPES DE CONGÉS
 // ════════════════════════════════════════════════════════════
 
@@ -986,8 +1287,9 @@ app.get('/api/stats', authenticate, authorize('rh', 'admin', 'director'), async 
   try {
     const year = req.query.year || new Date().getFullYear();
     const [byType, byStatus, byMonth, topUsers] = await Promise.all([
-      db.many(`SELECT lt.label, lt.color, COUNT(*) AS count, SUM(lr.days_count) AS total_days
+      db.many(`SELECT lt.label, lt.color, COUNT(*) AS count, SUM(COALESCE(ret.charged_days, lr.days_count)) AS total_days
                FROM leave_requests lr JOIN leave_types lt ON lr.leave_type_id=lt.id
+               LEFT JOIN leave_returns ret ON ret.request_id=lr.id
                WHERE lr.status='approved' AND EXTRACT(YEAR FROM lr.start_date)=$1
                GROUP BY lt.label, lt.color ORDER BY total_days DESC`, [year]),
       db.many(`SELECT status, COUNT(*) AS count FROM leave_requests
@@ -995,8 +1297,9 @@ app.get('/api/stats', authenticate, authorize('rh', 'admin', 'director'), async 
       db.many(`SELECT EXTRACT(MONTH FROM start_date) AS month, COUNT(*) AS count
                FROM leave_requests WHERE status='approved' AND EXTRACT(YEAR FROM start_date)=$1
                GROUP BY month ORDER BY month`, [year]),
-      db.many(`SELECT u.first_name||' '||u.last_name AS name, SUM(lr.days_count) AS total_days
+      db.many(`SELECT u.first_name||' '||u.last_name AS name, SUM(COALESCE(ret.charged_days, lr.days_count)) AS total_days
                FROM leave_requests lr JOIN users u ON lr.user_id=u.id
+               LEFT JOIN leave_returns ret ON ret.request_id=lr.id
                WHERE lr.status='approved' AND EXTRACT(YEAR FROM lr.start_date)=$1
                GROUP BY u.id, name ORDER BY total_days DESC LIMIT 10`, [year]),
     ]);
@@ -1011,11 +1314,14 @@ app.get('/api/stats/export', authenticate, authorize('rh', 'admin', 'director'),
     const rows = await db.many(
       `SELECT u.last_name, u.first_name, u.email, p.name AS project, lt.label AS type,
               lr.start_date, lr.end_date, lr.days_count, lr.status, lr.is_emergency,
-              lr.reason, lr.rejection_note, lr.created_at
+              lr.reason, lr.rejection_note, lr.created_at,
+              CASE WHEN lr.status='approved' THEN add_business_days(lr.end_date, 1) END AS planned_return,
+              ret.actual_return_date, ret.gap_days, ret.charged_days, ret.status AS return_status, ret.regularization
        FROM leave_requests lr
        JOIN users u        ON lr.user_id = u.id
        JOIN leave_types lt ON lr.leave_type_id = lt.id
        LEFT JOIN projects p ON u.project_id = p.id
+       LEFT JOIN leave_returns ret ON ret.request_id = lr.id
        WHERE EXTRACT(YEAR FROM lr.start_date)=$1
        ORDER BY lr.start_date, u.last_name`,
       [year]
@@ -1023,11 +1329,17 @@ app.get('/api/stats/export', authenticate, authorize('rh', 'admin', 'director'),
     const STATUS = { pending: 'En attente', approved: 'Approuvée', rejected: 'Rejetée', cancelled: 'Annulée', draft: 'Brouillon' };
     const d   = (v) => v ? new Date(v).toLocaleDateString('fr-FR', { timeZone: 'UTC' }) : '';
     const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
-    const header = ['Nom', 'Prénom', 'Email', 'Projet', 'Type', 'Début', 'Fin', 'Jours ouvrés', 'Statut', 'Urgence', 'Motif', 'Motif de rejet', 'Soumise le'];
+    const RET = { declared: 'Déclaré', to_regularize: 'À régulariser', closed: 'Clôturé' };
+    const REG = { deduire_conge: 'Déduit du congé', sans_solde: 'Sans solde', maladie: 'Maladie', injustifiee: 'Injustifiée', historique: 'Historique' };
+    const num = (v) => v === null || v === undefined ? '' : String(parseFloat(v)).replace('.', ',');
+    const header = ['Nom', 'Prénom', 'Email', 'Projet', 'Type', 'Début', 'Fin', 'Jours ouvrés', 'Statut', 'Urgence', 'Motif', 'Motif de rejet', 'Soumise le',
+                    'Retour prévu', 'Retour effectif', 'Écart (j)', 'Jours imputés', 'Suivi du retour', 'Régularisation'];
     const lines = rows.map(r => [
       r.last_name, r.first_name, r.email, r.project, r.type, d(r.start_date), d(r.end_date),
       String(r.days_count).replace('.', ','), STATUS[r.status] || r.status, r.is_emergency ? 'Oui' : 'Non',
       r.reason, r.rejection_note, d(r.created_at),
+      d(r.planned_return), d(r.actual_return_date), num(r.gap_days), num(r.charged_days),
+      r.status === 'approved' ? (RET[r.return_status] || 'À déclarer') : '', REG[r.regularization] || '',
     ].map(esc).join(';'));
     await audit(req.user.id, 'EXPORT_STATS', 'leave_request', null, null, { year, rows: rows.length }, req);
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
@@ -1408,6 +1720,12 @@ app.listen(config.port, () => {
   console.log(`  → http://localhost:${config.port}`);
   console.log(`  → Health: http://localhost:${config.port}/health\n`);
   checkLicenseOnStartup().catch(err => console.error('Licence check error:', err));
+  // Relances de retour de congé : au démarrage puis toutes les heures
+  const reminders = () => runReturnReminders()
+    .then(n => n && console.log(`⏰ ${n} relance(s) de retour envoyée(s)`))
+    .catch(err => console.error('Relances retour :', err.message));
+  setTimeout(reminders, 10 * 1000);
+  setInterval(reminders, 60 * 60 * 1000);
 });
 
 module.exports = { app, pool };

@@ -3,7 +3,8 @@ import { useNavigate } from 'react-router-dom'
 import api, { downloadFile } from '../api/axios'
 import useAuthStore from '../store/authStore'
 import { generateLeavePDF, calcReturnDate } from '../utils/generatePDF'
-import { fmtDate, STATUS_FR } from '../utils/dates'
+import { fmtDate, STATUS_FR, RETURN_FR, REGULARIZATION_FR, awaitingReturn, todayIso } from '../utils/dates'
+import ReturnModal from '../components/ReturnModal'
 import { refreshCounters, ROLE_LABELS } from '../navigation'
 import { ORG_CITY } from '../config'
 
@@ -15,6 +16,8 @@ export default function Requests() {
   const [filter,   setFilter]   = useState('all')
   const [detail,   setDetail]   = useState<any | null>(null)
   const [steps,    setSteps]    = useState<any[] | null>(null)
+  const [retInfo,  setRetInfo]  = useState<any | null>(null)
+  const [returnFor, setReturnFor] = useState<any | null>(null)
   const [cancelling, setCancelling] = useState<any | null>(null)
   const [msg,      setMsg]      = useState<{ type: string; text: string } | null>(null)
 
@@ -34,8 +37,11 @@ export default function Requests() {
   const openDetail = async (r: any) => {
     setDetail(r)
     setSteps(null)
-    try { setSteps((await api.get(`/requests/${r.id}/steps`)).data) }
-    catch { setSteps([]) }
+    setRetInfo(null)
+    try {
+      const [s, ret] = await Promise.all([api.get(`/requests/${r.id}/steps`), api.get(`/requests/${r.id}/return`)])
+      setSteps(s.data); setRetInfo(ret.data)
+    } catch { setSteps([]) }
   }
 
   const confirmCancel = async () => {
@@ -59,7 +65,7 @@ export default function Requests() {
       days_count:    parseFloat(r.days_count),
       start_date:    r.start_date,
       end_date:      r.end_date,
-      return_date:   calcReturnDate(r.end_date),
+      return_date:   r.planned_return_date || calcReturnDate(r.end_date),
       reason:        r.reason || '—',
       status:        r.status,
       manager_name:  r.manager_name,
@@ -133,7 +139,21 @@ export default function Requests() {
                     {r.reason || '—'}
                   </td>
                   <td>
-                    <span className={`badge badge-${r.status}`}>{STATUS_FR[r.status] || r.status}</span>
+                    {r.return_status ? (
+                      <span className={`badge ${r.return_status === 'closed' ? 'badge-cancelled' : 'badge-pending'}`}
+                        title={r.return_status === 'closed' && r.actual_return_date ? `Retour effectif le ${fmtDate(r.actual_return_date)}` : ''}>
+                        {r.return_status === 'closed' ? '✓ Clôturée' : RETURN_FR[r.return_status]}
+                      </span>
+                    ) : awaitingReturn(r) && r.planned_return_date?.slice(0, 10) <= todayIso() ? (
+                      <span className="badge badge-pending">↩ Retour à déclarer</span>
+                    ) : (
+                      <span className={`badge badge-${r.status}`}>{STATUS_FR[r.status] || r.status}</span>
+                    )}
+                    {r.return_status === 'closed' && parseFloat(r.gap_days) !== 0 && (
+                      <div style={{ fontSize: '.68rem', color: 'var(--muted)', marginTop: 2 }}>
+                        Retour le {fmtDate(r.actual_return_date)} ({parseFloat(r.gap_days) > 0 ? '+' : ''}{parseFloat(r.gap_days)} j)
+                      </div>
+                    )}
                     {r.status === 'pending' && r.approval_levels > 1 && (
                       <div style={{ fontSize: '.68rem', color: 'var(--muted)', marginTop: 2 }}>
                         {r.current_level === 1 ? 'Chez le superviseur' : 'Chez les RH'}
@@ -152,6 +172,11 @@ export default function Requests() {
                     <div style={{ display: 'flex', gap: 4 }}>
                       <button className="btn btn-sm btn-outline" onClick={() => openDetail(r)} title="Détail et suivi">🔍</button>
                       <button className="btn btn-sm btn-outline" onClick={() => handlePDF(r)} title="Télécharger le formulaire PDF">📄</button>
+                      {awaitingReturn(r) && (
+                        <button className="btn btn-sm btn-green" onClick={() => setReturnFor(r)} title="Déclarer mon retour de congé">
+                          ↩ Je suis de retour
+                        </button>
+                      )}
                       {r.status === 'pending' && (
                         <button className="btn btn-sm btn-outline" style={{ color: 'var(--danger)' }}
                           onClick={() => setCancelling(r)} title="Annuler la demande">✕</button>
@@ -177,7 +202,7 @@ export default function Requests() {
               <span style={{ color: 'var(--muted)' }}>Période</span>
               <span>{fmtDate(detail.start_date, { dateStyle: 'full' })} → {fmtDate(detail.end_date, { dateStyle: 'full' })}</span>
               <span style={{ color: 'var(--muted)' }}>Durée</span><span>{parseFloat(detail.days_count)} jour(s) ouvré(s)</span>
-              <span style={{ color: 'var(--muted)' }}>Retour prévu</span><span>{fmtDate(calcReturnDate(detail.end_date), { dateStyle: 'full' })}</span>
+              <span style={{ color: 'var(--muted)' }}>Retour prévu</span><span>{fmtDate(detail.planned_return_date || calcReturnDate(detail.end_date), { dateStyle: 'full' })}</span>
               <span style={{ color: 'var(--muted)' }}>Motif</span><span>{detail.reason || '—'}</span>
               <span style={{ color: 'var(--muted)' }}>Superviseur</span><span>{detail.manager_name || '—'}</span>
               {detail.has_document && (<>
@@ -214,6 +239,58 @@ export default function Requests() {
                   <div>En attente {detail.current_level === 1 ? 'du superviseur' : 'des RH'}</div>
                 </div>
               )}
+              {retInfo && retInfo.regularization !== 'historique' && (<>
+                {retInfo.declared_at && (
+                  <div className="step">
+                    <div className="step-dot" style={{ background: 'var(--accent)' }}>↩</div>
+                    <div>
+                      <strong>Retour déclaré</strong> {retInfo.declared_by_name ? `par ${retInfo.declared_by_name}` : ''} : reprise le {fmtDate(retInfo.actual_return_date)}
+                      <div style={{ fontSize: '.72rem', color: 'var(--muted)' }}>
+                        {new Date(retInfo.declared_at).toLocaleString('fr-FR', { dateStyle: 'short', timeStyle: 'short' })}
+                      </div>
+                      {retInfo.gap_reason && <div style={{ fontStyle: 'italic' }}>Motif de l’écart : « {retInfo.gap_reason} »</div>}
+                    </div>
+                  </div>
+                )}
+                {retInfo.confirmed_at && (
+                  <div className="step">
+                    <div className="step-dot" style={{ background: parseFloat(retInfo.gap_days) > 0 ? 'var(--warn)' : 'var(--success)' }}>✓</div>
+                    <div>
+                      <strong>Retour confirmé</strong> par {retInfo.confirmed_by_name} — {parseFloat(retInfo.gap_days) === 0 ? 'à la date prévue'
+                        : parseFloat(retInfo.gap_days) < 0 ? `anticipé de ${-parseFloat(retInfo.gap_days)} j (rendus au solde)`
+                        : `tardif de ${parseFloat(retInfo.gap_days)} j`}
+                      <div style={{ fontSize: '.72rem', color: 'var(--muted)' }}>
+                        {new Date(retInfo.confirmed_at).toLocaleString('fr-FR', { dateStyle: 'short', timeStyle: 'short' })}
+                      </div>
+                      {retInfo.confirmation_comment && <div style={{ fontStyle: 'italic' }}>« {retInfo.confirmation_comment} »</div>}
+                    </div>
+                  </div>
+                )}
+                {retInfo.regularized_at && (
+                  <div className="step">
+                    <div className="step-dot" style={{ background: 'var(--success)' }}>✓</div>
+                    <div>
+                      <strong>Régularisé</strong> par {retInfo.regularized_by_name} : {REGULARIZATION_FR[retInfo.regularization]}
+                      <div style={{ fontSize: '.72rem', color: 'var(--muted)' }}>
+                        {new Date(retInfo.regularized_at).toLocaleString('fr-FR', { dateStyle: 'short', timeStyle: 'short' })}
+                      </div>
+                      {retInfo.regularization_comment && <div style={{ fontStyle: 'italic' }}>« {retInfo.regularization_comment} »</div>}
+                    </div>
+                  </div>
+                )}
+              </>)}
+              {retInfo?.status === 'closed' && (
+                <div className="step">
+                  <div className="step-dot" style={{ background: 'var(--navy)' }}>■</div>
+                  <div><strong>Congé clôturé</strong>{retInfo.regularization === 'historique' ? ' (clôture automatique, antérieur au suivi des retours)' : ''} — {parseFloat(retInfo.charged_days)} j imputé(s) au solde</div>
+                </div>
+              )}
+              {detail.status === 'approved' && !retInfo && detail.start_date.slice(0, 10) < todayIso() && (
+                <div className="step">
+                  <div className="step-dot" style={{ background: 'var(--warn)' }}>…</div>
+                  <div>Retour à déclarer (prévu le {fmtDate(detail.planned_return_date)})</div>
+                </div>
+              )}
               {detail.status === 'approved' && steps?.length === 0 && (
                 <div className="step">
                   <div className="step-dot" style={{ background: 'var(--success)' }}>✓</div>
@@ -225,6 +302,11 @@ export default function Requests() {
             <button className="btn btn-outline" style={{ width: '100%', marginTop: '1rem' }} onClick={() => setDetail(null)}>Fermer</button>
           </div>
         </div>
+      )}
+
+      {returnFor && (
+        <ReturnModal request={returnFor} mode="declare" onClose={() => setReturnFor(null)}
+          onDone={text => { setReturnFor(null); setMsg({ type: 'success', text }); refreshCounters(); load() }} />
       )}
 
       {/* Confirmation d'annulation */}
