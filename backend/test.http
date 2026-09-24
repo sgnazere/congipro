@@ -1,0 +1,11 @@
+### Health check
+GET http://localhost:5173/health
+
+### Login (remplacer par un compte de test local — ne jamais commiter de vrai mot de passe)
+POST http://localhost:5173/api/auth/login
+Content-Type: application/json
+
+{
+  "email": "rh@exemple.local",
+  "password": "MOT_DE_PASSE_DE_TEST"
+}

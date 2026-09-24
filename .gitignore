@@ -1,0 +1,24 @@
+# Dépendances et builds
+node_modules/
+dist/
+dist-ssr/
+
+# Secrets et données locales — ne jamais commiter
+.env
+.env.*
+!.env.example
+licenses/
+backend/uploads/
+*.dump
+*.log
+
+# Outils locaux
+.claude/
+.agents/
+.kilo/
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+docs/
