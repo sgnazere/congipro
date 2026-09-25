@@ -161,7 +161,7 @@ export default function Admin() {
                   <td>{a.used_days ?? '—'} {a.adjusted_days > 0 && `(${a.adjusted_days})`}</td>
                   <td>{a.pending_days ?? '—'}</td>
                   <td style={{ fontSize: '.75rem', color: 'var(--muted)' }}>
-                    {a.anomalie === 'solde_negatif' ? `Dépassement de ${-(a.total_days - a.used_days - a.pending_days)} j : décision RH` : `pris ${parseFloat(a.approved_days) + parseFloat(a.adjusted_days || 0)} · attente ${a.pending_calc}`}
+                    {a.anomalie === 'solde_negatif' ? `Dépassement de ${-(parseFloat(a.total_days) + parseFloat(a.carried_days || 0) - parseFloat(a.used_days) - parseFloat(a.pending_days))} j sans solde l’an prochain : générer les soldes` : `pris ${parseFloat(a.approved_days) + parseFloat(a.adjusted_days || 0)} · attente ${a.pending_calc}`}
                   </td>
                 </tr>
               ))}

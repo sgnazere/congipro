@@ -101,6 +101,19 @@ const bal = async (tok, code) => { const b = (await call(tok, 'GET', '/balances/
   check('Pas de relance en double', (await call(E, 'GET', '/notifications')).data.length === before);
   check('Manager : retour « non déclaré » à enregistrer', (await call(M, 'GET', '/returns/to-process')).data.some(r => r.id === e.id && r.action === 'record' && r.overdue_days > 0));
 
+  console.log('— Report du dépassement sur l’année suivante');
+  // Type à 2 j/an : 2 j pris + 3 j de retard déduits → 3 j dus, reportés sur l'année suivante
+  T.TESTDEF = (await call(rh, 'POST', '/leave-types', { code: 'TESTDEF', label: 'Test dépassement', max_days_per_year: 2, approval_levels: 1 })).data;
+  const f = (await call(E, 'POST', '/requests', { leave_type_id: T.TESTDEF.id, start_date: '2026-08-17', end_date: '2026-08-18', reason: 'Test dépassement' })).data;
+  await call(M, 'PATCH', `/requests/${f.id}/approve`, { action: 'approved' });
+  await call(M, 'POST', `/requests/${f.id}/return`, { actual_return_date: '2026-08-24', reason: 'Prolongation' });
+  x = await call(rh, 'PATCH', `/requests/${f.id}/return/regularize`, { regularization: 'deduire_conge' });
+  check('Retard déduit : 5 j imputés sur 2 j de droits', x.data.charged_days === 5, x);
+  const g = await call(E, 'POST', '/requests', { leave_type_id: T.TESTDEF.id, start_date: '2027-03-01', end_date: '2027-03-01', reason: 'Année suivante' });
+  check('Année suivante : demande refusée (2 j − 3 j reportés)', g.status === 422, g);
+  const next = (await call(E, 'GET', '/balances/me?year=2027')).data.find(b => b.code === 'TESTDEF');
+  check('Solde 2027 : report de −3 j, disponible −1 j', next && +next.carried_days === -3 && +next.available_days === -1, next);
+
   console.log('— Divers');
   const p = (await call(E, 'POST', '/requests', { leave_type_id: T.TESTN1.id, start_date: '2026-09-02', end_date: '2026-09-02', reason: 'en attente' })).data;
   check('Retour sur demande non approuvée refusé (409)', (await call(E, 'POST', `/requests/${p.id}/return`, { actual_return_date: '2026-09-03' })).status === 409);

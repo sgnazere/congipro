@@ -635,9 +635,11 @@ app.get('/api/projects/:id/members', authenticate, async (req, res) => {
 // GET /api/balances/me
 app.get('/api/balances/me', authenticate, async (req, res) => {
   try {
-    const year = new Date().getFullYear();
+    // ?year= : soldes d'une autre année (ex. demande posée pour l'an prochain)
+    const year = parseInt(req.query.year) || new Date().getFullYear();
     const balances = await db.many(
-      `SELECT lb.id, lb.total_days, lb.used_days, lb.pending_days, lb.carried_days, lb.adjusted_days, lb.adjustment_note,
+      `SELECT lb.id, lb.year, lb.total_days, lb.used_days, lb.pending_days, lb.carried_days, lb.adjusted_days, lb.adjustment_note,
+              lb.total_days + lb.carried_days - lb.used_days - lb.pending_days AS available_days,
               lt.label, lt.color, lt.code, lt.max_days_per_year
        FROM leave_balances lb
        JOIN leave_types lt ON lb.leave_type_id = lt.id
@@ -703,7 +705,7 @@ app.get('/api/requests/to-validate', authenticate, async (req, res) => {
     if (req.user.role === 'employee') return res.json([]);
     const rows = await db.many(
       REQUEST_SELECT.replace('FROM leave_requests lr', `,
-         (SELECT b.total_days - b.used_days - b.pending_days FROM leave_balances b
+         (SELECT b.total_days + b.carried_days - b.used_days - b.pending_days FROM leave_balances b
           WHERE b.user_id = lr.user_id AND b.leave_type_id = lr.leave_type_id
             AND b.year = EXTRACT(YEAR FROM lr.start_date)) AS balance_after
        FROM leave_requests lr`) + `
@@ -817,7 +819,8 @@ app.post('/api/requests', authenticate, validate(requestSchema), async (req, res
     if (days === 0) return res.status(422).json({ error: 'Aucun jour ouvré dans la période sélectionnée' });
 
     const balance   = await ensureBalance(req.user.id, leave_type_id, year);
-    const available = parseFloat(balance.total_days) - parseFloat(balance.used_days) - parseFloat(balance.pending_days);
+    // Disponible = acquis + report de l'année précédente (≤ 0) − pris − en attente
+    const available = parseFloat(balance.total_days) + parseFloat(balance.carried_days) - parseFloat(balance.used_days) - parseFloat(balance.pending_days);
     if (available < days) {
       return res.status(422).json({ error: `Solde insuffisant : ${available} j disponible(s), ${days} j demandé(s)`, available, requested: days });
     }
@@ -1465,7 +1468,7 @@ app.get('/api/admin/db-stats', authenticate, authorize('admin'), async (req, res
     ]);
     const balance_anomalies = await db.many(
       `SELECT u.first_name||' '||u.last_name AS user_name, lt.label AS type_label, v.year, v.anomalie,
-              v.total_days, v.used_days, v.pending_days, v.adjusted_days, v.approved_days, v.pending_calc
+              v.total_days, v.carried_days, v.used_days, v.pending_days, v.adjusted_days, v.approved_days, v.pending_calc
        FROM v_balance_check v JOIN users u ON u.id=v.user_id JOIN leave_types lt ON lt.id=v.leave_type_id
        ORDER BY u.last_name, v.year`
     );

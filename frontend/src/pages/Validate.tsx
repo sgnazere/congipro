@@ -350,7 +350,7 @@ export default function Validate() {
                 </span>
                 {action === 'approved' && selected.balance_after !== null && parseFloat(selected.balance_after) < 0 && (
                   <div style={{ fontSize: '.75rem', marginTop: 4, color: 'var(--danger)', fontWeight: 600 }}>
-                    ⚠️ Cette demande dépasse le solde du collaborateur ({parseFloat(selected.balance_after)} j après approbation).
+                    ⚠️ Cette demande dépasse le solde du collaborateur ({parseFloat(selected.balance_after)} j après approbation) : le dépassement sera déduit de ses droits de l’année suivante.
                   </div>
                 )}
                 {action === 'approved' && selected.current_level < selected.approval_levels && (

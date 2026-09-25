@@ -102,7 +102,7 @@ export default function Dashboard() {
           <div key={b.id} className="stat-card">
             <div className="stat-label">{b.label} disponibles</div>
             <div className="stat-val" style={{ color: b.color }}>
-              {parseFloat(b.total_days) - parseFloat(b.used_days) - parseFloat(b.pending_days)} j
+              {parseFloat(b.available_days)} j
             </div>
             <div className="prog-wrap">
               <div className="prog-bar" style={{
@@ -110,7 +110,11 @@ export default function Dashboard() {
                 background: b.color
               }} />
             </div>
-            <div className="stat-sub">{parseFloat(b.used_days)} pris sur {parseFloat(b.total_days)} j</div>
+            <div className="stat-sub">
+              {parseFloat(b.used_days)} pris sur {parseFloat(b.total_days)} j
+              {parseFloat(b.carried_days) < 0 && ` · ${parseFloat(b.carried_days)} j reportés de ${b.year - 1}`}
+              {parseFloat(b.available_days) < 0 && ` · à déduire sur ${b.year + 1}`}
+            </div>
           </div>
         )) : (
           <div className="stat-card">

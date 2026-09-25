@@ -25,7 +25,9 @@ export default function NewRequest() {
   const [file,       setFile]       = useState<File | null>(null)
   const [form,       setForm]       = useState(emptyForm)
 
-  const loadBalances = () => api.get('/balances/me').then(b => setBalances(b.data))
+  // Soldes de l'année de la demande (droits attribués par année)
+  const [balanceYear, setBalanceYear] = useState(new Date().getFullYear())
+  const loadBalances = (y = balanceYear) => api.get('/balances/me', { params: { year: y } }).then(b => setBalances(b.data))
 
   useEffect(() => {
     const load = async () => {
@@ -42,6 +44,8 @@ export default function NewRequest() {
   useEffect(() => {
     if (!year) return
     api.get(`/holidays?year=${year}`).then(r => setHolidays(r.data.map((h: any) => h.date.slice(0, 10))))
+    setBalanceYear(parseInt(year))
+    loadBalances(parseInt(year))
   }, [year])
 
   const type    = leaveTypes.find(t => t.id === form.leave_type_id)
@@ -62,7 +66,7 @@ export default function NewRequest() {
   }
   const days = calcDays()
   const holidaysInRange = holidays.filter(h => h >= form.start_date && h <= form.end_date).length
-  const available = balance ? parseFloat(balance.total_days) - parseFloat(balance.used_days) - parseFloat(balance.pending_days) : null
+  const available = balance ? parseFloat(balance.available_days) : null
 
   const onFile = (f: File | null) => {
     setMsg(null)
@@ -253,14 +257,14 @@ export default function NewRequest() {
         </div>
 
         <div className="card">
-          <div className="card-title">Mes soldes {new Date().getFullYear()}</div>
+          <div className="card-title">Mes soldes {balanceYear}</div>
           {balances.length === 0 ? (
             <div style={{ color: 'var(--muted)', fontSize: '.82rem' }}>
               Aucun solde configuré — il sera créé automatiquement à votre première demande.
             </div>
           ) : (
             balances.map(b => {
-              const avail = parseFloat(b.total_days) - parseFloat(b.used_days) - parseFloat(b.pending_days)
+              const avail = parseFloat(b.available_days)
               const pct = Math.min(100, Math.round((parseFloat(b.used_days) / parseFloat(b.total_days)) * 100))
               return (
                 <div key={b.id} style={{ marginBottom: 14 }}>
@@ -273,6 +277,12 @@ export default function NewRequest() {
                   </div>
                   <div style={{ fontSize: '.7rem', color: 'var(--muted)' }}>
                     {parseFloat(b.used_days)} pris · {parseFloat(b.pending_days)} en attente · {parseFloat(b.total_days)} acquis
+                    {parseFloat(b.carried_days) < 0 && (
+                      <span title={`Jours pris en trop en ${balanceYear - 1}, déduits de ${balanceYear}`}> · {parseFloat(b.carried_days)} j reportés de {balanceYear - 1}</span>
+                    )}
+                    {avail < 0 && parseFloat(b.total_days) + parseFloat(b.carried_days) - parseFloat(b.used_days) < 0 && (
+                      <span style={{ color: 'var(--danger)' }}> · dépassement à déduire sur {balanceYear + 1}</span>
+                    )}
                     {parseFloat(b.adjusted_days) > 0 && (
                       <span title={b.adjustment_note || ''}> · dont {parseFloat(b.adjusted_days)} j de reprise</span>
                     )}

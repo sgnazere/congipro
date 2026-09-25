@@ -5,7 +5,7 @@ Application web de demande, validation et suivi des congés (projet « Congipro 
 - Demandes en ligne avec décompte en jours ouvrés (hors week-ends et fériés), justificatifs, annulation
 - Circuit de validation à 0, 1 ou 2 niveaux (superviseur direct puis RH)
 - Retour effectif : l'employé déclare sa reprise, le superviseur la confirme ; retour anticipé (jours rendus) ou tardif (régularisation RH) ; relances automatiques J+1 puis J+3 (RH)
-- Soldes annuels par type de congé, calendrier, planning équipe, notifications internes
+- Soldes annuels par type de congé (un dépassement est déduit des droits de l’année suivante), calendrier, planning équipe, notifications internes
 - Référentiels (utilisateurs, projets, types de congés, jours fériés), statistiques et export CSV, journal d'audit
 - 6 rôles : employé, manager, RH, directeur, Conseil d’administration (valide les congés du directeur), super administrateur
 
@@ -53,7 +53,7 @@ cd backend
 export TEST_RH_EMAIL=... TEST_RH_PASSWORD=...     # compte RH de test
 npm run test:e2e:circuit                          # circuit, Conseil, modification de comptes (58 contrôles)
 psql -d congipro -f tests/cleanup_test_data.sql   # nettoyage entre deux scénarios
-npm run test:e2e:retours                          # retour effectif et relances (37 contrôles)
+npm run test:e2e:retours                          # retours, relances, report du dépassement (40 contrôles)
 psql -d congipro -f tests/cleanup_test_data.sql
 ```
 
