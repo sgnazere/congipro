@@ -1,5 +1,5 @@
 // Source unique des menus par rôle : sert à la barre latérale ET à la protection des routes
-export type Role = 'employee' | 'manager' | 'rh' | 'director' | 'admin'
+export type Role = 'employee' | 'manager' | 'rh' | 'director' | 'board' | 'admin'
 
 export interface MenuItem { path: string; icon: string; label: string; badge?: 'validate' }
 
@@ -17,6 +17,14 @@ export const MENUS: Record<Role, MenuItem[]> = {
     { path: '/team',          icon: '👥', label: 'Planning équipe'  },
     { path: '/new-request',   icon: '➕', label: 'Nouvelle demande' },
     { path: '/requests',      icon: '📋', label: 'Mes demandes'     },
+    { path: '/calendar',      icon: '📅', label: 'Calendrier'       },
+    { path: '/notifications', icon: '🔔', label: 'Notifications'    },
+  ],
+  // Conseil d'administration : valide les congés du Directeur exécutif, rien d'autre
+  board: [
+    { path: '/dashboard',     icon: '🏛️', label: 'Tableau de bord'  },
+    { path: '/validate',      icon: '✅', label: 'Validation', badge: 'validate' },
+    { path: '/team',          icon: '👥', label: 'Planning équipe'  },
     { path: '/calendar',      icon: '📅', label: 'Calendrier'       },
     { path: '/notifications', icon: '🔔', label: 'Notifications'    },
   ],
@@ -67,6 +75,7 @@ export const ROLE_LABELS: Record<string, string> = {
   rh:       'Ressources humaines',
   admin:    'Super administrateur',
   director: 'Directeur exécutif',
+  board:    'Conseil d’administration',
 }
 
 export const PAGE_TITLES: Record<string, string> = {

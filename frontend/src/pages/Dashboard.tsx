@@ -17,6 +17,8 @@ export default function Dashboard() {
 
   const isValidator = canAccess(user?.role, '/validate')
   const seesOrg     = ['rh', 'admin', 'director'].includes(user?.role || '')
+  // Le Conseil d'administration valide mais ne pose pas de congés
+  const canRequest  = canAccess(user?.role, '/new-request')
 
   useEffect(() => {
     const load = async () => {
@@ -89,6 +91,7 @@ export default function Dashboard() {
           </div>
         )}
 
+        {canRequest && (<>
         <div className="stat-card" style={{ cursor: 'pointer' }} onClick={() => navigate('/requests')}>
           <div className="stat-label">Mes demandes en attente</div>
           <div className="stat-val" style={{ color: 'var(--warn)' }}>{myPending}</div>
@@ -116,9 +119,10 @@ export default function Dashboard() {
             <div className="stat-sub">Créés automatiquement à la première demande</div>
           </div>
         )}
+        </>)}
       </div>
 
-      <div className="card">
+      {canRequest && <div className="card">
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
           <div className="card-title" style={{ margin: 0 }}>Mes dernières demandes</div>
           <div style={{ display: 'flex', gap: 8 }}>
@@ -154,7 +158,7 @@ export default function Dashboard() {
             </tbody>
           </table>
         )}
-      </div>
+      </div>}
     </div>
   )
 }

@@ -18,6 +18,8 @@ const bal = async (tok, code) => { const b = (await call(tok, 'GET', '/balances/
   const rh = await login(RH_EMAIL, RH_PASSWORD);
   const me = (await call(rh, 'GET', '/users/me')).data;
   const T = Object.fromEntries((await call(rh, 'GET', '/leave-types')).data.map(t => [t.code, t]));
+  // Type dédié aux tests (1 niveau, 30 j) : ne dépend pas du paramétrage de l'organisation
+  T.TESTN1 = (await call(rh, 'POST', '/leave-types', { code: 'TESTN1', label: 'Test 1 niveau', max_days_per_year: 30, approval_levels: 1 })).data;
   const pw = 'TestAudit2026!';
   const mgr = (await call(rh, 'POST', '/users', { email: 'test-audit.manager@ecogec.test', password: pw, first_name: 'Koffi', last_name: 'TEST-AUDIT', role: 'manager', manager_id: me.id })).data;
   const emp = (await call(rh, 'POST', '/users', { email: 'test-audit.employe@ecogec.test', password: pw, first_name: 'Aya', last_name: 'TEST-AUDIT', role: 'employee', manager_id: mgr.id })).data;
@@ -32,12 +34,12 @@ const bal = async (tok, code) => { const b = (await call(tok, 'GET', '/balances/
     return r;
   };
 
-  console.log('— Retour à l’heure (RTT 21-23/09, retour prévu 24/09)');
-  const a = await approved('RTT', '2026-09-21', '2026-09-23', 'Test retour à l’heure');
+  console.log('— Retour à l’heure (1 niveau 21-23/09, retour prévu 24/09)');
+  const a = await approved('TESTN1', '2026-09-21', '2026-09-23', 'Test retour à l’heure');
   let list = (await call(E, 'GET', '/requests/all')).data;
   const ra = list.find(x => x.id === a.id);
   check('Retour prévu calculé : 24/09', ra.planned_return_date === '2026-09-24', ra.planned_return_date);
-  let x = await call(E, 'POST', `/requests/${a.id}/return`, { actual_return_date: '2026-09-25' });
+  let x = await call(E, 'POST', `/requests/${a.id}/return`, { actual_return_date: new Date(Date.now() + 864e5).toISOString().slice(0, 10) });
   check('Date future refusée (422)', x.status === 422, x);
   x = await call(E, 'POST', `/requests/${a.id}/return`, { actual_return_date: '2026-09-24', comment: 'De retour ce matin' });
   check('Employé déclare → declared, écart 0', x.data.status === 'declared' && x.data.gap_days === 0, x);
@@ -48,7 +50,7 @@ const bal = async (tok, code) => { const b = (await call(tok, 'GET', '/balances/
   check('Notification au manager', (await call(M, 'GET', '/notifications')).data.some(n => n.request_id === a.id && n.title.includes('Retour')));
   x = await call(M, 'PATCH', `/requests/${a.id}/return/confirm`, { comment: 'Bon retour' });
   check('Manager confirme → closed', x.data.status === 'closed', x);
-  check('Solde RTT : 3 j pris', (await bal(E, 'RTT')).used === 3);
+  check('Solde 1 niveau : 3 j pris', (await bal(E, 'TESTN1')).used === 3);
   check('Nouvelle déclaration sur un congé clôturé refusée (409)', (await call(E, 'POST', `/requests/${a.id}/return`, { actual_return_date: '2026-09-24' })).status === 409);
   const det = (await call(E, 'GET', `/requests/${a.id}/return`)).data;
   check('Trace : déclarant, confirmateur, horodatages', det.declared_by_name === 'Aya TEST-AUDIT' && det.confirmed_by_name === 'Koffi TEST-AUDIT' && det.declared_at && det.confirmed_at, det);
@@ -77,18 +79,18 @@ const bal = async (tok, code) => { const b = (await call(tok, 'GET', '/balances/
   check('RH : déduire du congé → clôturé, 5 j imputés', x.data.status === 'closed' && x.data.charged_days === 5, x);
   check('Solde CP : 3 + 5 = 8 j pris', (await bal(E, 'CP')).used === 8);
 
-  console.log('— Retour tardif déclaré par l’employé, régularisé sans solde (RTT 31/08-01/09, retour le 04/09)');
-  const d = await approved('RTT', '2026-08-31', '2026-09-01', 'Test sans solde');
+  console.log('— Retour tardif déclaré par l’employé, régularisé sans solde (1 niveau 31/08-01/09, retour le 04/09)');
+  const d = await approved('TESTN1', '2026-08-31', '2026-09-01', 'Test sans solde');
   x = await call(E, 'POST', `/requests/${d.id}/return`, { actual_return_date: '2026-09-04', reason: 'Transport bloqué' });
   check('Déclaré, +2 j', x.data.status === 'declared' && x.data.gap_days === 2, x);
   x = await call(M, 'PATCH', `/requests/${d.id}/return/confirm`, {});
   check('Confirmé → à régulariser', x.data.status === 'to_regularize', x);
   x = await call(rh, 'PATCH', `/requests/${d.id}/return/regularize`, { regularization: 'sans_solde' });
   check('Sans solde → 2 j imputés seulement', x.data.charged_days === 2, x);
-  check('Solde RTT : 3 + 2 = 5 j pris', (await bal(E, 'RTT')).used === 5);
+  check('Solde 1 niveau : 3 + 2 = 5 j pris', (await bal(E, 'TESTN1')).used === 5);
 
-  console.log('— Relances (RTT 24-25/08 approuvé, jamais déclaré)');
-  const e = await approved('RTT', '2026-08-24', '2026-08-25', 'Test relance');
+  console.log('— Relances (1 niveau 24-25/08 approuvé, jamais déclaré)');
+  const e = await approved('TESTN1', '2026-08-24', '2026-08-25', 'Test relance');
   x = await call(rh, 'POST', '/returns/run-reminders');
   check('Relances envoyées', x.status === 200 && /[1-9]/.test(x.data.message), x);
   check('Employé relancé', (await call(E, 'GET', '/notifications')).data.some(n => n.request_id === e.id && n.type === 'reminder'));
@@ -100,7 +102,7 @@ const bal = async (tok, code) => { const b = (await call(tok, 'GET', '/balances/
   check('Manager : retour « non déclaré » à enregistrer', (await call(M, 'GET', '/returns/to-process')).data.some(r => r.id === e.id && r.action === 'record' && r.overdue_days > 0));
 
   console.log('— Divers');
-  const p = (await call(E, 'POST', '/requests', { leave_type_id: T.RTT.id, start_date: '2026-09-02', end_date: '2026-09-02', reason: 'en attente' })).data;
+  const p = (await call(E, 'POST', '/requests', { leave_type_id: T.TESTN1.id, start_date: '2026-09-02', end_date: '2026-09-02', reason: 'en attente' })).data;
   check('Retour sur demande non approuvée refusé (409)', (await call(E, 'POST', `/requests/${p.id}/return`, { actual_return_date: '2026-09-03' })).status === 409);
   const csv = await (await fetch(`${B}/stats/export?year=2026`, { headers: { Authorization: 'Bearer ' + rh } })).text();
   check('Export CSV : colonnes et statut de retour', csv.includes('Retour effectif') && csv.includes('Clôturé') && csv.includes('Déduit du congé'));

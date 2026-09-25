@@ -2,7 +2,7 @@
 BEGIN;
 CREATE TEMP TABLE tu AS SELECT id FROM users WHERE email LIKE 'test-audit.%@ecogec.test';
 CREATE TEMP TABLE tr AS SELECT id FROM leave_requests WHERE user_id IN (SELECT id FROM tu);
-CREATE TEMP TABLE tt AS SELECT id FROM leave_types WHERE code='TESTAUDIT';
+CREATE TEMP TABLE tt AS SELECT id FROM leave_types WHERE code IN ('TESTAUDIT', 'TESTN1');
 DELETE FROM notifications WHERE request_id IN (SELECT id FROM tr) OR user_id IN (SELECT id FROM tu);
 DELETE FROM approval_steps WHERE request_id IN (SELECT id FROM tr) OR approver_id IN (SELECT id FROM tu);
 DELETE FROM leave_returns WHERE request_id IN (SELECT id FROM tr);

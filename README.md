@@ -7,7 +7,7 @@ Application web de demande, validation et suivi des congés (projet « Congipro 
 - Retour effectif : l'employé déclare sa reprise, le superviseur la confirme ; retour anticipé (jours rendus) ou tardif (régularisation RH) ; relances automatiques J+1 puis J+3 (RH)
 - Soldes annuels par type de congé, calendrier, planning équipe, notifications internes
 - Référentiels (utilisateurs, projets, types de congés, jours fériés), statistiques et export CSV, journal d'audit
-- 5 rôles : employé, manager, RH, directeur, super administrateur
+- 6 rôles : employé, manager, RH, directeur, Conseil d’administration (valide les congés du directeur), super administrateur
 
 ## Pile technique
 
@@ -51,7 +51,7 @@ Scénarios API avec comptes fictifs (`test-audit.*@ecogec.test`), sur une base d
 ```bash
 cd backend
 export TEST_RH_EMAIL=... TEST_RH_PASSWORD=...     # compte RH de test
-npm run test:e2e:circuit                          # circuit de validation (47 contrôles)
+npm run test:e2e:circuit                          # circuit, Conseil, modification de comptes (58 contrôles)
 psql -d congipro -f tests/cleanup_test_data.sql   # nettoyage entre deux scénarios
 npm run test:e2e:retours                          # retour effectif et relances (37 contrôles)
 psql -d congipro -f tests/cleanup_test_data.sql

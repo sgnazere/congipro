@@ -353,7 +353,7 @@ app.get('/api/users', authenticate, authorize('rh', 'admin'), async (req, res) =
   try {
     const users = await db.many(
       `SELECT u.id, u.email, u.first_name, u.last_name, u.role,
-              u.is_active, u.hire_date, u.manager_id,
+              u.is_active, u.hire_date, u.manager_id, u.project_id,
               p.name AS project, p.code AS project_code,
               m.first_name||' '||m.last_name AS manager_name
        FROM users u
@@ -366,7 +366,7 @@ app.get('/api/users', authenticate, authorize('rh', 'admin'), async (req, res) =
 });
 
 // GET /api/users/team — collaborateurs directs et leurs absences à venir (planning équipe)
-app.get('/api/users/team', authenticate, authorize('manager', 'director', 'rh', 'admin'), async (req, res) => {
+app.get('/api/users/team', authenticate, authorize('manager', 'director', 'board', 'rh', 'admin'), async (req, res) => {
   try {
     const from = req.query.from || new Date().toISOString().slice(0, 10);
     const to   = req.query.to   || new Date(Date.now() + 60 * 864e5).toISOString().slice(0, 10);
@@ -398,12 +398,13 @@ app.get('/api/users/team', authenticate, authorize('manager', 'director', 'rh', 
 });
 
 // POST /api/users
+const ROLES = ['employee', 'manager', 'rh', 'director', 'board', 'admin'];
 const createUserSchema = z.object({
   email:      z.string().email(),
   password:   z.string().min(8),
   first_name: z.string().min(1).max(100),
   last_name:  z.string().min(1).max(100),
-  role:       z.enum(['employee', 'manager', 'rh', 'director', 'admin']),
+  role:       z.enum(ROLES),
   project_id: z.string().uuid().optional(),
   manager_id: z.string().uuid().optional(),
   hire_date:  z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
@@ -420,7 +421,7 @@ const managerIdSchema = z.object({
 const ensureManager = async (managerId) => {
   const manager = await db.one(
     `SELECT id FROM users
-     WHERE id=$1 AND is_active=TRUE AND role IN ('manager', 'rh', 'admin', 'director')`,
+     WHERE id=$1 AND is_active=TRUE AND role IN ('manager', 'rh', 'admin', 'director', 'board')`,
     [managerId]
   );
   return manager;
@@ -465,8 +466,44 @@ app.post('/api/users', authenticate, authorize('rh', 'admin'), validate(createUs
 });
 
 // PATCH /api/users/:id
+const profileSchema = z.object({
+  first_name: z.string().trim().min(1).max(100).optional(),
+  last_name:  z.string().trim().min(1).max(100).optional(),
+  email:      z.string().trim().email('Email invalide').optional(),
+  role:       z.enum(ROLES).optional(),
+  project_id: z.string().uuid().nullable().optional(),
+  hire_date:  z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+});
+const PROFILE_FIELDS = Object.keys(profileSchema.shape);
+
 app.patch('/api/users/:id', authenticate, authorize('rh', 'admin'), async (req, res) => {
   try {
+    // Modification du profil (nom, email, rôle, projet, date d'embauche)
+    if (PROFILE_FIELDS.some(f => req.body[f] !== undefined)) {
+      const parsed = profileSchema.safeParse(req.body);
+      if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Données invalides' });
+      const data = parsed.data;
+      const target = await db.one(
+        'SELECT id, email, first_name, last_name, role, project_id, hire_date FROM users WHERE id=$1', [req.params.id]);
+      if (!target) return res.status(404).json({ error: 'Utilisateur introuvable' });
+      if (req.user.role !== 'admin' && (target.role === 'admin' || data.role === 'admin')) {
+        return res.status(403).json({ error: 'Seul un super administrateur peut modifier ce compte' });
+      }
+      if (data.role && data.role !== target.role && req.params.id === req.user.id) {
+        return res.status(400).json({ error: 'Vous ne pouvez pas changer votre propre rôle' });
+      }
+      const next = { ...target, ...data, email: (data.email ?? target.email).toLowerCase() };
+      const roleChanged = next.role !== target.role;
+      const user = await db.one(
+        `UPDATE users SET first_name=$1, last_name=$2, email=$3, role=$4, project_id=$5, hire_date=$6,
+                refresh_token = CASE WHEN $7 THEN NULL ELSE refresh_token END, updated_at=NOW()
+         WHERE id=$8 RETURNING id, email, first_name, last_name, role, project_id, hire_date`,
+        [next.first_name, next.last_name, next.email, next.role, next.project_id, next.hire_date, roleChanged, req.params.id]
+      );
+      // Un changement de rôle oblige à se reconnecter (le rôle est porté par le jeton)
+      await audit(req.user.id, 'UPDATE_USER_PROFILE', 'user', user.id, target, user, req);
+      return res.json(user);
+    }
     if (req.body.manager_id !== undefined) {
       const result = managerIdSchema.safeParse({ manager_id: req.body.manager_id });
       if (!result.success) return res.status(400).json({ error: 'Superviseur invalide' });
@@ -502,7 +539,10 @@ app.patch('/api/users/:id', authenticate, authorize('rh', 'admin'), async (req, 
     if (!user) return res.status(404).json({ error: 'Utilisateur introuvable' });
     await audit(req.user.id, 'UPDATE_USER', 'user', user.id, null, user, req);
     res.json(user);
-  } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'Cet email est déjà utilisé' });
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
 });
 
 // PATCH /api/users/:id/assign-project
@@ -601,7 +641,7 @@ app.get('/api/balances/me', authenticate, async (req, res) => {
               lt.label, lt.color, lt.code, lt.max_days_per_year
        FROM leave_balances lb
        JOIN leave_types lt ON lb.leave_type_id = lt.id
-       WHERE lb.user_id=$1 AND lb.year=$2 ORDER BY lt.label`,
+       WHERE lb.user_id=$1 AND lb.year=$2 AND lt.is_active=TRUE ORDER BY lt.label`,
       [req.user.id, year]
     );
     res.json(balances);
@@ -641,7 +681,7 @@ app.get('/api/requests', authenticate, async (req, res) => {
 
     if (req.user.role === 'employee') {
       sql += ` AND lr.user_id=$${pi++}`; params.push(req.user.id);
-    } else if (req.user.role === 'manager') {
+    } else if (['manager', 'board'].includes(req.user.role)) {
       sql += ` AND (lr.user_id=$${pi} OR u.manager_id=$${pi})`; pi++; params.push(req.user.id);
     }
 
@@ -832,7 +872,7 @@ app.post('/api/requests', authenticate, validate(requestSchema), async (req, res
 });
 
 // PATCH /api/requests/:id/approve
-app.patch('/api/requests/:id/approve', authenticate, authorize('manager', 'rh', 'admin', 'director'), async (req, res) => {
+app.patch('/api/requests/:id/approve', authenticate, authorize('manager', 'rh', 'admin', 'director', 'board'), async (req, res) => {
   try {
     const { action, comment } = req.body;
     if (!['approved', 'rejected'].includes(action)) return res.status(400).json({ error: 'Action invalide' });
@@ -1034,7 +1074,7 @@ app.post('/api/requests/:id/return', authenticate, async (req, res) => {
 });
 
 // PATCH /api/requests/:id/return/confirm — confirmation (date éventuellement corrigée)
-app.patch('/api/requests/:id/return/confirm', authenticate, authorize('manager', 'director', 'rh', 'admin'), async (req, res) => {
+app.patch('/api/requests/:id/return/confirm', authenticate, authorize('manager', 'director', 'board', 'rh', 'admin'), async (req, res) => {
   try {
     const current = await db.one('SELECT actual_return_date FROM leave_returns WHERE request_id=$1', [req.params.id]);
     const date = req.body.actual_return_date || current?.actual_return_date;

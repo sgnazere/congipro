@@ -9,9 +9,10 @@ const ROLE_COLORS: Record<string, string> = {
   manager:  '#8B5CF6',
   rh:       '#10B981',
   director: '#F59E0B',
+  board:    '#0F2447',
   admin:    '#EF4444',
 }
-const SUPERVISOR_ROLES = ['manager', 'rh', 'director', 'admin']
+const SUPERVISOR_ROLES = ['manager', 'rh', 'director', 'board', 'admin']
 const NEEDS_SUPERVISOR = ['employee', 'manager']
 // Sans superviseur, ces rôles ne peuvent pas poser de congé soumis à validation
 const SHOULD_HAVE_SUPERVISOR = ['employee', 'manager', 'rh']
@@ -87,6 +88,26 @@ export default function Users() {
     } catch (err: any) {
       setMsg({ type: 'danger', text: err.response?.data?.error || 'Erreur' })
     }
+  }
+
+  const [editing, setEditing] = useState<any | null>(null)
+
+  const handleEdit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!editing) return
+    setSaving(true); setFormMsg(null)
+    try {
+      await api.patch(`/users/${editing.id}`, {
+        first_name: editing.first_name.trim(), last_name: editing.last_name.trim(), email: editing.email.trim(),
+        role: editing.role, project_id: editing.project_id || null,
+        ...(editing.hire_date ? { hire_date: editing.hire_date.slice(0, 10) } : {}),
+      })
+      setMsg({ type: 'success', text: `✅ Compte de ${editing.first_name} ${editing.last_name} mis à jour.` })
+      setEditing(null)
+      load()
+    } catch (err: any) {
+      setFormMsg(err.response?.data?.error || 'Erreur serveur')
+    } finally { setSaving(false) }
   }
 
   const assignManager = async (userId: string, managerId: string) => {
@@ -197,7 +218,10 @@ export default function Users() {
                       {u.is_active ? 'Actif' : 'Inactif'}
                     </span>
                   </td>
-                  <td>
+                  <td style={{ whiteSpace: 'nowrap' }}>
+                    <button className="btn btn-sm btn-outline" disabled={locked} style={{ marginRight: 4 }}
+                      title={locked ? 'Réservé au super administrateur' : 'Modifier nom, email, rôle, projet'}
+                      onClick={() => { setEditing({ ...u }); setFormMsg(null) }}>✎</button>
                     {u.id === me?.id ? <span className="form-hint">Vous</span> : (
                       <button className={`btn btn-sm ${u.is_active ? 'btn-outline' : 'btn-green'}`}
                         disabled={locked} title={locked ? 'Réservé au super administrateur' : ''}
@@ -212,6 +236,65 @@ export default function Users() {
           </tbody>
         </table>
       </div>
+
+      {editing && (
+        <div className="modal-backdrop" onClick={e => { if (e.target === e.currentTarget) setEditing(null) }}>
+          <div className="card" style={{ width: '100%', maxWidth: 540, maxHeight: '90vh', overflowY: 'auto' }}>
+            <div style={{ fontWeight: 700, fontSize: '1.1rem', color: 'var(--navy)', marginBottom: '1.25rem' }}>
+              ✎ Modifier le compte
+            </div>
+            {formMsg && <div className="alert alert-danger">❌ {formMsg}</div>}
+            <form onSubmit={handleEdit}>
+              <div className="form-row">
+                <div className="form-group">
+                  <label className="form-label">Prénom *</label>
+                  <input className="form-control" value={editing.first_name} required
+                    onChange={e => setEditing({ ...editing, first_name: e.target.value })} />
+                </div>
+                <div className="form-group">
+                  <label className="form-label">Nom *</label>
+                  <input className="form-control" value={editing.last_name} required
+                    onChange={e => setEditing({ ...editing, last_name: e.target.value })} />
+                </div>
+              </div>
+              <div className="form-group">
+                <label className="form-label">Email (identifiant de connexion) *</label>
+                <input className="form-control" type="email" value={editing.email} required
+                  onChange={e => setEditing({ ...editing, email: e.target.value })} />
+                <div className="form-hint">La personne se connectera désormais avec cette adresse ; son mot de passe ne change pas.</div>
+              </div>
+              <div className="form-row">
+                <div className="form-group">
+                  <label className="form-label">Rôle *</label>
+                  <select className="form-control" value={editing.role} disabled={editing.id === me?.id}
+                    onChange={e => setEditing({ ...editing, role: e.target.value })}>
+                    {Object.entries(ROLE_LABELS).filter(([k]) => k !== 'admin' || me?.role === 'admin').map(([k, v]) =>
+                      <option key={k} value={k}>{v}</option>)}
+                  </select>
+                  {editing.id === me?.id && <div className="form-hint">Vous ne pouvez pas changer votre propre rôle.</div>}
+                </div>
+                <div className="form-group">
+                  <label className="form-label">Projet</label>
+                  <select className="form-control" value={editing.project_id || ''}
+                    onChange={e => setEditing({ ...editing, project_id: e.target.value || null })}>
+                    <option value="">— Aucun —</option>
+                    {projects.map(p => <option key={p.id} value={p.id}>{p.name} ({p.code})</option>)}
+                  </select>
+                </div>
+              </div>
+              <div className="form-group">
+                <label className="form-label">Date d'embauche</label>
+                <input className="form-control" type="date" value={editing.hire_date?.slice(0, 10) || ''}
+                  onChange={e => setEditing({ ...editing, hire_date: e.target.value })} />
+              </div>
+              <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: '1rem' }}>
+                <button type="button" className="btn btn-outline" onClick={() => setEditing(null)}>Annuler</button>
+                <button type="submit" className="btn btn-navy" disabled={saving}>{saving ? 'Enregistrement...' : 'Enregistrer'}</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
 
       {showAdd && (
         <div className="modal-backdrop" onClick={e => { if (e.target === e.currentTarget) setShowAdd(false) }}>
@@ -258,6 +341,7 @@ export default function Users() {
                     <option value="manager">Manager</option>
                     <option value="rh">Ressources humaines</option>
                     <option value="director">Directeur exécutif</option>
+                    <option value="board">Conseil d’administration</option>
                     {me?.role === 'admin' && <option value="admin">Super administrateur</option>}
                   </select>
                 </div>
