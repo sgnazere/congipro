@@ -9,7 +9,7 @@ ALTER TABLE users DISABLE TRIGGER trg_audit_users;
 
 INSERT INTO users (email, password_hash, first_name, last_name, role, manager_id, project_id, hire_date)
 SELECT format('charge.mgr%s@charge.test', lpad(i::text, 3, '0')), :'hash', 'Manager', format('CHARGE-%s', lpad(i::text, 3, '0')),
-       'manager', (SELECT id FROM users WHERE email = 'de@ec-ci.org'),
+       'manager', (SELECT id FROM users WHERE role = 'director' AND is_active ORDER BY created_at LIMIT 1),
        (SELECT id FROM projects ORDER BY name LIMIT 1 OFFSET (i % 4)), '2024-01-15'
 FROM generate_series(1, 50) i;
 
