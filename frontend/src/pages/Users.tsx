@@ -3,6 +3,9 @@ import api from '../api/axios'
 import useAuthStore from '../store/authStore'
 import { ROLE_LABELS } from '../navigation'
 import { fmtDate } from '../utils/dates'
+import { Pager } from '../components/Pager'
+
+const PAGE_SIZE = 50
 
 const ROLE_COLORS: Record<string, string> = {
   employee: '#3B82F6',
@@ -24,7 +27,12 @@ const emptyForm = {
 
 export default function Users() {
   const { user: me } = useAuthStore()
+  // Page courante (côté serveur : 1000 comptes ne sont jamais chargés d'un bloc)
   const [users,    setUsers]    = useState<any[]>([])
+  const [total,    setTotal]    = useState(0)
+  const [stats,    setStats]    = useState<any>({})
+  const [page,     setPage]     = useState(1)
+  const [supervisors, setSupervisors] = useState<any[]>([])
   const [projects, setProjects] = useState<any[]>([])
   const [loading,  setLoading]  = useState(true)
   const [showAdd,  setShowAdd]  = useState(false)
@@ -36,10 +44,16 @@ export default function Users() {
   const [roleFilter, setRoleFilter] = useState('all')
 
   const load = async () => {
-    setLoading(true)
     try {
-      const [u, p] = await Promise.all([api.get('/users'), api.get('/projects')])
-      setUsers(u.data)
+      const [u, s, p] = await Promise.all([
+        api.get('/users', { params: { page, limit: PAGE_SIZE, search: search.trim() || undefined, role: roleFilter === 'all' ? undefined : roleFilter } }),
+        api.get('/users', { params: { roles: SUPERVISOR_ROLES.join(',') } }),
+        api.get('/projects'),
+      ])
+      setUsers(u.data.rows)
+      setTotal(u.data.total)
+      setStats(u.data.stats)
+      setSupervisors(s.data.filter((x: any) => x.is_active))
       setProjects(p.data)
     } catch (err) {
       console.error(err)
@@ -48,10 +62,13 @@ export default function Users() {
     }
   }
 
-  useEffect(() => { load() }, [])
+  // Recherche envoyée au serveur 300 ms après la dernière frappe
+  useEffect(() => {
+    const t = setTimeout(load, search ? 300 : 0)
+    return () => clearTimeout(t)
+  }, [page, search, roleFilter])
 
-  const supervisors = users.filter(u => SUPERVISOR_ROLES.includes(u.role) && u.is_active)
-  const nameOf = (id: string) => { const s = users.find(u => u.id === id); return s ? `${s.first_name} ${s.last_name}` : '' }
+  const nameOf = (id: string) => { const s = supervisors.find(u => u.id === id); return s ? `${s.first_name} ${s.last_name}` : '' }
 
   const handleAdd = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -120,11 +137,8 @@ export default function Users() {
     }
   }
 
-  const filtered = users.filter(u =>
-    (roleFilter === 'all' || u.role === roleFilter) &&
-    `${u.first_name} ${u.last_name} ${u.email} ${u.project || ''}`.toLowerCase().includes(search.toLowerCase())
-  )
-  const withoutSupervisor = users.filter(u => SHOULD_HAVE_SUPERVISOR.includes(u.role) && u.is_active && !u.manager_id).length
+  const filtered = users
+  const withoutSupervisor = stats.without_supervisor || 0
 
   if (loading) return <div className="loader-wrap"><div className="loader" /></div>
 
@@ -139,10 +153,10 @@ export default function Users() {
 
       <div className="stat-grid" style={{ gridTemplateColumns: 'repeat(4,1fr)' }}>
         {[
-          { label: 'Total',       val: users.length,                                                  color: 'var(--accent)'  },
-          { label: 'Employés',    val: users.filter(u => u.role === 'employee').length,               color: '#3B82F6'        },
-          { label: 'Encadrants',  val: users.filter(u => SUPERVISOR_ROLES.includes(u.role)).length,   color: '#8B5CF6'        },
-          { label: 'Actifs',      val: users.filter(u => u.is_active).length,                         color: 'var(--success)' },
+          { label: 'Total',       val: stats.total ?? '—',       color: 'var(--accent)'  },
+          { label: 'Employés',    val: stats.employees ?? '—',   color: '#3B82F6'        },
+          { label: 'Encadrants',  val: stats.supervisors ?? '—', color: '#8B5CF6'        },
+          { label: 'Actifs',      val: stats.active ?? '—',      color: 'var(--success)' },
         ].map(s => (
           <div key={s.label} className="stat-card">
             <div className="stat-label">{s.label}</div>
@@ -153,8 +167,8 @@ export default function Users() {
 
       <div style={{ display: 'flex', gap: 10, marginBottom: '1rem', alignItems: 'center', flexWrap: 'wrap' }}>
         <input className="form-control" placeholder="🔍 Nom, email ou projet..." value={search}
-          onChange={e => setSearch(e.target.value)} style={{ maxWidth: 280 }} />
-        <select className="form-control" value={roleFilter} onChange={e => setRoleFilter(e.target.value)} style={{ maxWidth: 200 }}>
+          onChange={e => { setSearch(e.target.value); setPage(1) }} style={{ maxWidth: 280 }} />
+        <select className="form-control" value={roleFilter} onChange={e => { setRoleFilter(e.target.value); setPage(1) }} style={{ maxWidth: 200 }}>
           <option value="all">Tous les rôles</option>
           {Object.entries(ROLE_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
         </select>
@@ -164,7 +178,7 @@ export default function Users() {
       </div>
 
       <div className="card">
-        <div className="card-title">Liste des utilisateurs ({filtered.length})</div>
+        <div className="card-title">Liste des utilisateurs ({total})</div>
         <table>
           <thead>
             <tr>
@@ -235,6 +249,7 @@ export default function Users() {
             })}
           </tbody>
         </table>
+        <Pager page={page} total={total} limit={PAGE_SIZE} onPage={setPage} />
       </div>
 
       {editing && (

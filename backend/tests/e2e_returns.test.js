@@ -119,7 +119,7 @@ const bal = async (tok, code) => { const b = (await call(tok, 'GET', '/balances/
   check('Retour sur demande non approuvée refusé (409)', (await call(E, 'POST', `/requests/${p.id}/return`, { actual_return_date: '2026-09-03' })).status === 409);
   const csv = await (await fetch(`${B}/stats/export?year=2026`, { headers: { Authorization: 'Bearer ' + rh } })).text();
   check('Export CSV : colonnes et statut de retour', csv.includes('Retour effectif') && csv.includes('Clôturé') && csv.includes('Déduit du congé'));
-  const anomalies = (await call(rh, 'GET', '/audit-logs')).data.filter(l => ['DECLARE_RETURN', 'CONFIRM_RETURN', 'RECORD_RETURN', 'REGULARIZE_RETURN', 'RETURN_REMINDER'].includes(l.action));
+  const anomalies = (await call(rh, 'GET', '/audit-logs?limit=200')).data.rows.filter(l => ['DECLARE_RETURN', 'CONFIRM_RETURN', 'RECORD_RETURN', 'REGULARIZE_RETURN', 'RETURN_REMINDER'].includes(l.action));
   check('Audit : déclarations, confirmations, régularisations, relances tracées', new Set(anomalies.map(l => l.action)).size === 5, [...new Set(anomalies.map(l => l.action))]);
 
   console.log(`\n${pass} réussis, ${fail} échoués`);

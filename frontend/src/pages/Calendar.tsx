@@ -18,8 +18,10 @@ export default function Calendar() {
   useEffect(() => {
     const load = async () => {
       try {
+        // Seul le mois affiché : pour les RH, « toutes les demandes » = toute l'organisation
+        const last = new Date(year, month + 1, 0).getDate()
         const [r, h] = await Promise.all([
-          api.get('/requests'),
+          api.get('/requests', { params: { from: `${year}-${pad(month + 1)}-01`, to: `${year}-${pad(month + 1)}-${pad(last)}` } }),
           api.get(`/holidays?year=${year}`),
         ])
         setRequests(r.data)
@@ -27,7 +29,7 @@ export default function Calendar() {
       } catch (err) { console.error(err) }
     }
     load()
-  }, [year])
+  }, [year, month])
 
   const pad = (n: number) => String(n).padStart(2, '0')
   const dateStr = (d: number) => `${year}-${pad(month + 1)}-${pad(d)}`

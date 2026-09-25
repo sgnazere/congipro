@@ -157,5 +157,6 @@ async function run() {
   saveLicense(result);
 }
 
-run().catch(console.error);
+// Mode interactif seulement en ligne de commande (node generator.js), pas à l'import
+if (require.main === module) run().catch(console.error);
 module.exports = { generateLicense, signPayload };

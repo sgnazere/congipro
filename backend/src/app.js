@@ -268,8 +268,35 @@ app.use(async (req, res, next) => {
 // Rate limiting
 // Limite générale large (une page = 2 à 4 appels) ; limite stricte sur la seule connexion,
 // le rafraîchissement de token ne doit pas épuiser le quota de tentatives
-app.use('/api/',           rateLimit({ windowMs: 15*60*1000, max: 1000, message: { error: 'Trop de requêtes' } }));
-app.use('/api/auth/login', rateLimit({ windowMs: 15*60*1000, max: 10,   message: { error: 'Trop de tentatives de connexion, réessayez dans 15 minutes' } }));
+// Limites anti-abus. Tout un bureau sort souvent par la même IP (NAT) : compter par IP
+// bloquerait l'organisation entière. On compte donc par UTILISATEUR (jeton, même expiré,
+// dont la signature est vérifiée) et, pour la connexion, par compte visé.
+const LIMITS = {
+  windowMs:   15 * 60 * 1000,
+  perUser:    parseInt(process.env.RATE_LIMIT_PER_USER)  || 1500,  // requêtes / 15 min / utilisateur
+  perIp:      parseInt(process.env.RATE_LIMIT_PER_IP)    || 100000, // filet anti-inondation d'une IP : un bureau NATé de 1000 personnes ≈ 45 000 req / 15 min en pointe
+  anonPerIp:  parseInt(process.env.RATE_LIMIT_ANON_IP)   || 5000,  // requêtes sans jeton valide / 15 min / IP
+  loginPerAccount: parseInt(process.env.RATE_LIMIT_LOGIN_ACCOUNT) || 10,  // essais / 15 min / (email, IP)
+};
+const userFromToken = (req) => {
+  const h = req.headers.authorization;
+  if (!h?.startsWith('Bearer ')) return null;
+  try { return jwt.verify(h.slice(7), config.jwtSecret, { ignoreExpiration: true }).id; } catch { return null; }
+};
+const tooMany = { error: 'Trop de requêtes, réessayez dans quelques minutes' };
+app.use('/api/', rateLimit({ windowMs: LIMITS.windowMs, max: LIMITS.perIp, message: tooMany, standardHeaders: true, legacyHeaders: false }));
+app.use('/api/', rateLimit({
+  windowMs: LIMITS.windowMs, message: tooMany, standardHeaders: true, legacyHeaders: false,
+  keyGenerator: (req) => { const id = userFromToken(req); return id ? `u:${id}` : `ip:${req.ip}`; },
+  max: (req) => userFromToken(req) ? LIMITS.perUser : LIMITS.anonPerIp,
+  validate: { keyGeneratorIpFallback: false },
+}));
+app.use('/api/auth/login', rateLimit({
+  windowMs: LIMITS.windowMs, max: LIMITS.loginPerAccount, standardHeaders: true, legacyHeaders: false,
+  keyGenerator: (req) => `login:${String(req.body?.email || '').toLowerCase()}|${req.ip}`,
+  validate: { keyGeneratorIpFallback: false },
+  message: { error: 'Trop de tentatives de connexion sur ce compte, réessayez dans 15 minutes' },
+}));
 
 // ════════════════════════════════════════════════════════════
 //  AUTH
@@ -349,20 +376,42 @@ app.get('/api/users/me', authenticate, async (req, res) => {
 });
 
 // GET /api/users
+//  ?page=&limit=&search=&role= → { rows, total, stats } (écran Utilisateurs)
+//  ?roles=a,b                   → liste simple filtrée (ex. superviseurs possibles)
+//  sans paramètre               → liste complète (compatibilité)
 app.get('/api/users', authenticate, authorize('rh', 'admin'), async (req, res) => {
   try {
-    const users = await db.many(
-      `SELECT u.id, u.email, u.first_name, u.last_name, u.role,
-              u.is_active, u.hire_date, u.manager_id, u.project_id,
-              p.name AS project, p.code AS project_code,
-              m.first_name||' '||m.last_name AS manager_name
-       FROM users u
+    const { page, search, role, roles } = req.query;
+    const where = [], params = [];
+    if (search) { params.push(`%${search.toLowerCase()}%`);
+      where.push(`LOWER(u.first_name||' '||u.last_name||' '||u.email||' '||COALESCE(p.name,'')) LIKE $${params.length}`); }
+    if (role)   { params.push(role); where.push(`u.role = $${params.length}`); }
+    if (roles)  { params.push(String(roles).split(',')); where.push(`u.role = ANY($${params.length}::user_role[])`); }
+    const from = `FROM users u
        LEFT JOIN projects p ON u.project_id = p.id
        LEFT JOIN users m    ON u.manager_id = m.id
-       ORDER BY u.last_name, u.first_name`
-    );
-    res.json(users);
-  } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
+       ${where.length ? 'WHERE ' + where.join(' AND ') : ''}`;
+    const select = `SELECT u.id, u.email, u.first_name, u.last_name, u.role,
+              u.is_active, u.hire_date, u.manager_id, u.project_id,
+              p.name AS project, p.code AS project_code,
+              m.first_name||' '||m.last_name AS manager_name ${from}
+       ORDER BY u.last_name, u.first_name`;
+    if (page === undefined) return res.json(await db.many(select, params));
+
+    const limit  = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 200);
+    const offset = (Math.max(parseInt(page) || 1, 1) - 1) * limit;
+    const [rows, total, stats] = await Promise.all([
+      db.many(`${select} LIMIT ${limit} OFFSET ${offset}`, params),
+      db.one(`SELECT COUNT(*)::int AS n ${from}`, params),
+      db.one(`SELECT COUNT(*)::int AS total,
+                COUNT(*) FILTER (WHERE role='employee')::int AS employees,
+                COUNT(*) FILTER (WHERE role IN ('manager','rh','director','board','admin'))::int AS supervisors,
+                COUNT(*) FILTER (WHERE is_active)::int AS active,
+                COUNT(*) FILTER (WHERE is_active AND manager_id IS NULL AND role IN ('employee','manager','rh'))::int AS without_supervisor
+              FROM users`),
+    ]);
+    res.json({ rows, total: total.n, page: offset / limit + 1, limit, stats });
+  } catch (err) { console.error(err); res.status(500).json({ error: 'Erreur serveur' }); }
 });
 
 // GET /api/users/team — collaborateurs directs et leurs absences à venir (planning équipe)
@@ -663,7 +712,7 @@ const REQUEST_SELECT = `
          u.first_name||' '||u.last_name AS user_name,
          m.first_name||' '||m.last_name AS manager_name,
          p.name AS department,
-         add_business_days(lr.end_date, 1) AS planned_return_date,
+         lr.planned_return_date,
          ret.status AS return_status, ret.actual_return_date, ret.gap_days, ret.regularization
   FROM leave_requests lr
   JOIN leave_types lt  ON lr.leave_type_id = lt.id
@@ -691,6 +740,10 @@ app.get('/api/requests', authenticate, async (req, res) => {
     if (from)   { sql += ` AND lr.end_date>=$${pi++}`; params.push(from); }
     if (to)     { sql += ` AND lr.start_date<=$${pi++}`; params.push(to); }
 
+    if (req.query.count) {
+      const r = await db.one(`SELECT COUNT(*)::int AS count FROM (${sql}) x`, params);
+      return res.json({ count: r.count });
+    }
     sql += ' ORDER BY lr.created_at DESC';
     res.json(await db.many(sql, params));
   } catch (err) {
@@ -966,7 +1019,7 @@ async function loadForReturn(requestId, actualReturnDate) {
   return db.one(
     `SELECT lr.*, u.manager_id AS requester_manager_id, u.first_name, u.last_name,
             ret.status AS return_status, ret.gap_reason AS declared_reason, ret.declaration_comment,
-            add_business_days(lr.end_date, 1) AS planned_return_date,
+            lr.planned_return_date,
             CASE WHEN $2::date IS NULL THEN NULL
                  ELSE business_days_between(lr.start_date, $2::date - 1) END AS actual_days
      FROM leave_requests lr
@@ -1162,8 +1215,8 @@ app.get('/api/returns/to-process', authenticate, async (req, res) => {
       `SELECT lr.id, lr.user_id, lr.start_date, lr.end_date, lr.days_count, lr.return_reminder_level,
               lt.label AS type_label, lt.color,
               u.first_name||' '||u.last_name AS user_name, p.name AS department,
-              add_business_days(lr.end_date, 1) AS planned_return_date,
-              business_days_between(add_business_days(lr.end_date, 1), CURRENT_DATE - 1) AS overdue_days,
+              lr.planned_return_date,
+              CASE WHEN ret.request_id IS NULL THEN business_days_between(lr.planned_return_date, CURRENT_DATE - 1) END AS overdue_days,
               ret.status AS return_status, ret.actual_return_date, ret.actual_days, ret.gap_days, ret.gap_reason,
               ret.declaration_comment, ret.confirmation_comment,
               CASE WHEN ret.status = 'to_regularize' THEN 'regularize'
@@ -1176,7 +1229,7 @@ app.get('/api/returns/to-process', authenticate, async (req, res) => {
        LEFT JOIN leave_returns ret ON ret.request_id = lr.id
        WHERE lr.status = 'approved' AND lr.user_id <> $1
          AND ( (ret.status = 'to_regularize' AND $2 IN ('rh', 'admin'))
-            OR ((ret.status = 'declared' OR (ret.request_id IS NULL AND add_business_days(lr.end_date, 1) <= CURRENT_DATE))
+            OR ((ret.status = 'declared' OR (ret.request_id IS NULL AND lr.planned_return_date <= CURRENT_DATE))
                 AND ($2 = 'admin' OR u.manager_id = $1)) )
        ORDER BY (ret.status = 'to_regularize') DESC, (ret.status = 'declared') DESC, lr.end_date`,
       [req.user.id, req.user.role]
@@ -1189,16 +1242,29 @@ app.get('/api/returns/to-process', authenticate, async (req, res) => {
 
 // ── Relances : J+1 ouvré après le retour prévu → employé + superviseur ; J+3 → RH ──
 async function runReturnReminders() {
+  // Verrou consultatif : avec plusieurs processus (PM2) ou une tâche planifiée en parallèle,
+  // un seul passage s'exécute ; les autres sortent sans rien envoyer
+  const lock = await pool.connect();
+  try {
+    const { rows: [l] } = await lock.query('SELECT pg_try_advisory_lock(8110) AS ok');
+    if (!l.ok) return 0;
+    try { return await sendReturnReminders(); }
+    finally { await lock.query('SELECT pg_advisory_unlock(8110)'); }
+  } finally { lock.release(); }
+}
+
+async function sendReturnReminders() {
   const rows = await db.many(
     `SELECT lr.id, lr.user_id, lr.return_reminder_level AS level, u.manager_id, u.first_name, u.last_name,
-            add_business_days(lr.end_date, 1) AS planned, ret.status AS return_status,
-            CASE WHEN add_business_days(lr.end_date, 4) <= CURRENT_DATE THEN 2 ELSE 1 END AS target
+            lr.planned_return_date AS planned, ret.status AS return_status,
+            CASE WHEN add_business_days(lr.planned_return_date, 3) <= CURRENT_DATE THEN 2 ELSE 1 END AS target
      FROM leave_requests lr
      JOIN users u ON u.id = lr.user_id
      LEFT JOIN leave_returns ret ON ret.request_id = lr.id
      WHERE lr.status = 'approved' AND lr.return_reminder_level < 2
        AND (ret.request_id IS NULL OR ret.status = 'declared')
-       AND add_business_days(lr.end_date, 2) <= CURRENT_DATE`
+       AND lr.planned_return_date < CURRENT_DATE              -- filtre indexé (idx_leave_requests_approved_return)
+       AND add_business_days(lr.planned_return_date, 1) <= CURRENT_DATE`
   );
   let sent = 0;
   for (const r of rows) {
@@ -1358,7 +1424,7 @@ app.get('/api/stats/export', authenticate, authorize('rh', 'admin', 'director'),
       `SELECT u.last_name, u.first_name, u.email, p.name AS project, lt.label AS type,
               lr.start_date, lr.end_date, lr.days_count, lr.status, lr.is_emergency,
               lr.reason, lr.rejection_note, lr.created_at,
-              CASE WHEN lr.status='approved' THEN add_business_days(lr.end_date, 1) END AS planned_return,
+              CASE WHEN lr.status='approved' THEN lr.planned_return_date END AS planned_return,
               ret.actual_return_date, ret.gap_days, ret.charged_days, ret.status AS return_status, ret.regularization
        FROM leave_requests lr
        JOIN users u        ON lr.user_id = u.id
@@ -1433,16 +1499,31 @@ app.patch('/api/notifications/:id/read', authenticate, async (req, res) => {
 //  AUDIT LOGS
 // ════════════════════════════════════════════════════════════
 
+// ?page=&limit=&action=&search= → { rows, total, actions, stats } — filtres et tri côté serveur (index created_at)
 app.get('/api/audit-logs', authenticate, authorize('rh', 'admin'), async (req, res) => {
   try {
-    res.json(await db.many(
+    const limit  = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 200);
+    const offset = (Math.max(parseInt(req.query.page) || 1, 1) - 1) * limit;
+    const where = [], params = [];
+    if (req.query.action) { params.push(req.query.action); where.push(`al.action = $${params.length}`); }
+    if (req.query.search) { params.push(`%${String(req.query.search).toLowerCase()}%`);
+      where.push(`(LOWER(al.action) LIKE $${params.length} OR LOWER(u.first_name||' '||u.last_name) LIKE $${params.length})`); }
+    const from = `FROM audit_logs al LEFT JOIN users u ON al.user_id=u.id ${where.length ? 'WHERE ' + where.join(' AND ') : ''}`;
+    const [rows, total, actions, stats] = await Promise.all([
       // Pas d'old_value/new_value ni de user_agent : l'écran n'en a pas besoin
-      `SELECT al.id, al.user_id, al.action, al.entity_type, al.entity_id, al.ip_address, al.created_at,
-              u.first_name||' '||u.last_name AS user_name
-       FROM audit_logs al LEFT JOIN users u ON al.user_id=u.id
-       ORDER BY al.created_at DESC LIMIT 500`
-    ));
-  } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
+      db.many(`SELECT al.id, al.user_id, al.action, al.entity_type, al.entity_id, al.ip_address, al.created_at,
+                      u.first_name||' '||u.last_name AS user_name
+               ${from} ORDER BY al.created_at DESC LIMIT ${limit} OFFSET ${offset}`, params),
+      db.one(`SELECT COUNT(*)::int AS n ${from}`, params),
+      db.many(`SELECT DISTINCT action FROM audit_logs ORDER BY action`),
+      db.one(`SELECT COUNT(*)::int AS total,
+                COUNT(*) FILTER (WHERE action='LOGIN')::int AS logins,
+                COUNT(*) FILTER (WHERE action='CREATE_REQUEST')::int AS created,
+                COUNT(*) FILTER (WHERE action='APPROVED_REQUEST')::int AS approved
+              FROM audit_logs`),
+    ]);
+    res.json({ rows, total: total.n, page: offset / limit + 1, limit, actions: actions.map(a => a.action), stats });
+  } catch (err) { console.error(err); res.status(500).json({ error: 'Erreur serveur' }); }
 });
 
 // ════════════════════════════════════════════════════════════
@@ -1758,17 +1839,23 @@ async function checkLicenseOnStartup() {
 }
 
 // ── DÉMARRAGE ────────────────────────────────────────────────
-app.listen(config.port, () => {
+// require('./app') (tâche planifiée, tests) ne démarre pas de serveur
+if (require.main === module) app.listen(config.port, () => {
   console.log(`\n⟡ EcoGec API démarrée`);
   console.log(`  → http://localhost:${config.port}`);
   console.log(`  → Health: http://localhost:${config.port}/health\n`);
   checkLicenseOnStartup().catch(err => console.error('Licence check error:', err));
-  // Relances de retour de congé : au démarrage puis toutes les heures
-  const reminders = () => runReturnReminders()
-    .then(n => n && console.log(`⏰ ${n} relance(s) de retour envoyée(s)`))
-    .catch(err => console.error('Relances retour :', err.message));
-  setTimeout(reminders, 10 * 1000);
-  setInterval(reminders, 60 * 60 * 1000);
+  // Relances de retour : dans l'API seulement si REMINDERS_IN_API n'est pas « false »
+  // et sur la seule instance 0 en mode PM2 cluster. En production multi-processus,
+  // préférer la tâche planifiée `npm run job:reminders` (src/jobs/reminders.js).
+  const instance = process.env.NODE_APP_INSTANCE;
+  if (process.env.REMINDERS_IN_API !== 'false' && (instance === undefined || instance === '0')) {
+    const reminders = () => runReturnReminders()
+      .then(n => n && console.log(`⏰ ${n} relance(s) de retour envoyée(s)`))
+      .catch(err => console.error('Relances retour :', err.message));
+    setTimeout(reminders, 10 * 1000);
+    setInterval(reminders, 60 * 60 * 1000);
+  }
 });
 
-module.exports = { app, pool };
+module.exports = { app, pool, runReturnReminders };

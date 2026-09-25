@@ -1,5 +1,8 @@
 import { useEffect, useState } from 'react'
 import api from '../api/axios'
+import { Pager } from '../components/Pager'
+
+const PAGE_SIZE = 50
 
 const ACTION_COLORS: Record<string, string> = {
   LOGIN:            '#10B981',
@@ -14,31 +17,29 @@ const ACTION_COLORS: Record<string, string> = {
 
 export default function AuditLogs() {
   const [logs,    setLogs]    = useState<any[]>([])
+  const [total,   setTotal]   = useState(0)
+  const [stats,   setStats]   = useState<any>({})
+  const [actions, setActions] = useState<string[]>([])
+  const [page,    setPage]    = useState(1)
   const [loading, setLoading] = useState(true)
   const [search,  setSearch]  = useState('')
   const [filter,  setFilter]  = useState('all')
 
+  // Filtres, tri et pagination côté serveur (le journal compte des centaines de milliers de lignes)
   useEffect(() => {
     const load = async () => {
-      setLoading(true)
       try {
-        const res = await api.get('/audit-logs')
-        setLogs(res.data)
+        const res = await api.get('/audit-logs', { params: {
+          page, limit: PAGE_SIZE, search: search.trim() || undefined, action: filter === 'all' ? undefined : filter } })
+        setLogs(res.data.rows); setTotal(res.data.total); setStats(res.data.stats); setActions(res.data.actions)
       } catch (err) { console.error(err) }
       finally { setLoading(false) }
     }
-    load()
-  }, [])
+    const t = setTimeout(load, search ? 300 : 0)
+    return () => clearTimeout(t)
+  }, [page, search, filter])
 
-  const actions = ['all', ...Array.from(new Set(logs.map(l => l.action)))]
-
-  const filtered = logs.filter(l => {
-    const matchSearch = search === '' ||
-      l.action?.toLowerCase().includes(search.toLowerCase()) ||
-      l.user_name?.toLowerCase().includes(search.toLowerCase())
-    const matchFilter = filter === 'all' || l.action === filter
-    return matchSearch && matchFilter
-  })
+  const filtered = logs
 
   if (loading) return <div className="loader-wrap"><div className="loader" /></div>
 
@@ -47,10 +48,10 @@ export default function AuditLogs() {
       {/* Stats */}
       <div className="stat-grid" style={{ gridTemplateColumns: 'repeat(4,1fr)' }}>
         {[
-          { label: 'Total événements', val: logs.length,                                              color: 'var(--accent)'  },
-          { label: 'Connexions',        val: logs.filter(l => l.action === 'LOGIN').length,           color: 'var(--success)' },
-          { label: 'Demandes créées',   val: logs.filter(l => l.action === 'CREATE_REQUEST').length,  color: '#3B82F6'        },
-          { label: 'Approbations',      val: logs.filter(l => l.action === 'APPROVED_REQUEST').length,color: '#10B981'        },
+          { label: 'Total événements', val: stats.total ?? 0,                                              color: 'var(--accent)'  },
+          { label: 'Connexions',        val: stats.logins ?? 0,           color: 'var(--success)' },
+          { label: 'Demandes créées',   val: stats.created ?? 0,  color: '#3B82F6'        },
+          { label: 'Approbations',      val: stats.approved ?? 0,color: '#10B981'        },
         ].map(s => (
           <div key={s.label} className="stat-card">
             <div className="stat-label">{s.label}</div>
@@ -65,18 +66,18 @@ export default function AuditLogs() {
           className="form-control"
           placeholder="🔍 Rechercher..."
           value={search}
-          onChange={e => setSearch(e.target.value)}
+          onChange={e => { setSearch(e.target.value); setPage(1) }}
           style={{ maxWidth: 250 }}
         />
         <select className="form-control" style={{ maxWidth: 200 }}
-          value={filter} onChange={e => setFilter(e.target.value)}>
+          value={filter} onChange={e => { setFilter(e.target.value); setPage(1) }}>
           <option value="all">Toutes les actions</option>
-          {actions.filter(a => a !== 'all').map(a => (
+          {actions.map(a => (
             <option key={a} value={a}>{a}</option>
           ))}
         </select>
         <span style={{ alignSelf: 'center', fontSize: '.8rem', color: 'var(--muted)' }}>
-          {filtered.length} événement(s)
+          {total} événement(s)
         </span>
       </div>
 
@@ -129,6 +130,7 @@ export default function AuditLogs() {
             </tbody>
           </table>
         )}
+        <Pager page={page} total={total} limit={PAGE_SIZE} onPage={setPage} />
       </div>
     </div>
   )

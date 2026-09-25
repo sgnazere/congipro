@@ -139,7 +139,7 @@ const bal = async (tok, code) => {
   const team = (await call(M, 'GET', '/users/team?from=2026-11-01&to=2026-11-30')).data;
   check('Planning équipe : l’employé et ses absences', team.members.some(m => m.id === emp.id) && team.leaves.length >= 2, team);
   check('Employé : accès à /users refusé (403)', (await call(E, 'GET', '/users')).status === 403);
-  const logs = (await call(rh, 'GET', '/audit-logs')).data;
+  const logs = (await call(rh, 'GET', '/audit-logs?limit=200')).data.rows;
   check('Audit : aucun champ sensible renvoyé', !JSON.stringify(logs).match(/password_hash|refresh_token|new_value|old_value/));
   x = await call(rh, 'PATCH', `/users/${me.id}`, { is_active: false });
   check('Impossible de se désactiver soi-même (400)', x.status === 400, x);

@@ -27,14 +27,14 @@ export default function Dashboard() {
           api.get('/balances/me'),
           api.get('/requests/all'),
           isValidator ? api.get('/requests/to-validate') : Promise.resolve({ data: [] }),
-          seesOrg ? api.get('/requests', { params: { status: 'pending' } }) : Promise.resolve({ data: null }),
+          seesOrg ? api.get('/requests', { params: { status: 'pending', count: 1 } }) : Promise.resolve({ data: null }),
           isValidator ? api.get('/returns/to-process') : Promise.resolve({ data: [] }),
         ])
         setReturns(rt.data)
         setBalances(b.data)
         setMine(r.data)
         setToValidate(v.data)
-        setOrgPending(o.data ? o.data.length : null)
+        setOrgPending(o.data ? o.data.count : null)
       } catch (err) {
         console.error(err)
       } finally {

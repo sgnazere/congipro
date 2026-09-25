@@ -23,7 +23,7 @@ export default function Projects() {
     try {
       const [p, u] = await Promise.all([
         api.get('/projects'),
-        api.get('/users'),
+        api.get('/users', { params: { roles: 'manager,rh,admin,director' } }),
       ])
       setProjects(p.data)
       setManagers(u.data.filter((u: any) => ['manager', 'rh', 'admin', 'director'].includes(u.role)))
