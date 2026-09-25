@@ -6,7 +6,8 @@ const api = axios.create({
   headers: { 'Content-Type': 'application/json' },
 });
 
-const GET_CACHE_TTL = 15000;
+// Court : fusionne les appels simultanés d'un même écran sans afficher de données périmées
+const GET_CACHE_TTL = 2000;
 const getCache = new Map();
 const pendingGets = new Map();
 let refreshPromise = null;

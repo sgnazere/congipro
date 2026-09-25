@@ -113,7 +113,7 @@ export default function Dashboard() {
             <div className="stat-sub">
               {parseFloat(b.used_days)} pris sur {parseFloat(b.total_days)} j
               {parseFloat(b.carried_days) < 0 && ` · ${parseFloat(b.carried_days)} j reportés de ${b.year - 1}`}
-              {parseFloat(b.available_days) < 0 && ` · à déduire sur ${b.year + 1}`}
+              {parseFloat(b.total_days) + parseFloat(b.carried_days) - parseFloat(b.used_days) < 0 && ` · à déduire sur ${b.year + 1}`}
             </div>
           </div>
         )) : (
