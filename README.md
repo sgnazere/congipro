@@ -59,6 +59,22 @@ psql -d congipro -f tests/cleanup_test_data.sql
 
 La connexion est limitée à 10 tentatives / 15 min / IP : redémarrer l'API entre deux séries si nécessaire.
 
+## Tenue de charge
+
+Mesures du 25/09/2026 sur un portable (i7-1255U, 7,7 Go ; API, PostgreSQL et générateur sur la même machine),
+base peuplée de 1000 comptes et d'un an d'historique (8 500 demandes, 300 000 lignes d'audit) :
+
+| Scénario | Débit | Temps de réponse | Erreurs |
+|---|---|---|---|
+| Rafale de connexions (50 simultanées) | 41 connexions/s | médiane 1,2 s | 0 |
+| 300 utilisateurs actifs (clic toutes les 2-5 s) | 208 req/s | médiane 5 ms, p95 17 ms | 0 |
+| 994 utilisateurs actifs simultanément, 1 processus | 612 req/s | médiane 11 ms, p95 1,2 s | 0,6 % |
+
+La pointe réaliste de 1000 employés est de 30 à 50 req/s : **un seul processus Node suffit**.
+Réglages de production : voir la fin de `backend/.env.example` (`UV_THREADPOOL_SIZE`, `DB_HOST=127.0.0.1`,
+`DB_POOL_MAX`) ; relances en tâche planifiée (`npm run job:reminders`, avec `REMINDERS_IN_API=false`) si
+plusieurs processus. Scénario rejouable : `backend/tests/charge_seed.sql` puis `node tests/charge.js usage 300 120`.
+
 ## Sécurité
 
 Ne jamais commiter `.env`, les fichiers de licence (`licenses/`), les justificatifs (`backend/uploads/`) ni les sauvegardes de base : ils sont exclus par `.gitignore`.

@@ -4,6 +4,11 @@
 // ════════════════════════════════════════════════════════════
 
 require('dotenv').config({ path: require('path').join(__dirname, '../.env') });
+
+// Réserve de fils de libuv (4 par défaut) : bcrypt, résolution DNS et ouverture des connexions
+// PostgreSQL s'y partagent. En rafale de connexions, 4 fils saturés faisaient échouer
+// l'ouverture des connexions à la base (erreur 500). À fixer avant tout travail asynchrone.
+process.env.UV_THREADPOOL_SIZE ||= String(Math.max(4, require('os').cpus().length));
 const { getCachedLicense, checkLicenseFromDB, validateLicenseKey, invalidateCache } = require('./license/validator');
 
 const fs        = require('fs');
@@ -44,9 +49,9 @@ const config = {
     user:                   process.env.DB_USER     || 'postgres',
     password:               process.env.DB_PASS     || '',
     ssl:                    process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : false,
-    max:                    20,
-    idleTimeoutMillis:      30000,
-    connectionTimeoutMillis:2000,
+    max:                    parseInt(process.env.DB_POOL_MAX) || 20,
+    idleTimeoutMillis:      300000,   // garder les connexions ouvertes 5 min (rouvrir coûte cher)
+    connectionTimeoutMillis:10000,    // attente max d'une connexion libre ou nouvelle
   }
 };
 
@@ -1436,7 +1441,8 @@ app.get('/api/stats/export', authenticate, authorize('rh', 'admin', 'director'),
       [year]
     );
     const STATUS = { pending: 'En attente', approved: 'Approuvée', rejected: 'Rejetée', cancelled: 'Annulée', draft: 'Brouillon' };
-    const d   = (v) => v ? new Date(v).toLocaleDateString('fr-FR', { timeZone: 'UTC' }) : '';
+    // Formatage manuel : toLocaleDateString, appelé ~40 000 fois, prenait plusieurs secondes
+    const d   = (v) => { if (!v) return ''; const iso = typeof v === 'string' ? v : v.toISOString(); return `${iso.slice(8, 10)}/${iso.slice(5, 7)}/${iso.slice(0, 4)}`; };
     const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
     const RET = { declared: 'Déclaré', to_regularize: 'À régulariser', closed: 'Clôturé' };
     const REG = { deduire_conge: 'Déduit du congé', sans_solde: 'Sans solde', maladie: 'Maladie', injustifiee: 'Injustifiée', historique: 'Historique' };
@@ -1499,6 +1505,23 @@ app.patch('/api/notifications/:id/read', authenticate, async (req, res) => {
 //  AUDIT LOGS
 // ════════════════════════════════════════════════════════════
 
+// Compteurs globaux et liste des actions : balayent toute la table → recalculés au plus une fois par minute
+let auditSummary = null, auditSummaryAt = 0;
+async function getAuditSummary() {
+  if (auditSummary && Date.now() - auditSummaryAt < 60 * 1000) return auditSummary;
+  const [actions, stats] = await Promise.all([
+    db.many(`SELECT DISTINCT action FROM audit_logs ORDER BY action`),
+    db.one(`SELECT COUNT(*)::int AS total,
+              COUNT(*) FILTER (WHERE action='LOGIN')::int AS logins,
+              COUNT(*) FILTER (WHERE action='CREATE_REQUEST')::int AS created,
+              COUNT(*) FILTER (WHERE action='APPROVED_REQUEST')::int AS approved
+            FROM audit_logs`),
+  ]);
+  auditSummary = { actions: actions.map(a => a.action), stats };
+  auditSummaryAt = Date.now();
+  return auditSummary;
+}
+
 // ?page=&limit=&action=&search= → { rows, total, actions, stats } — filtres et tri côté serveur (index created_at)
 app.get('/api/audit-logs', authenticate, authorize('rh', 'admin'), async (req, res) => {
   try {
@@ -1509,20 +1532,16 @@ app.get('/api/audit-logs', authenticate, authorize('rh', 'admin'), async (req, r
     if (req.query.search) { params.push(`%${String(req.query.search).toLowerCase()}%`);
       where.push(`(LOWER(al.action) LIKE $${params.length} OR LOWER(u.first_name||' '||u.last_name) LIKE $${params.length})`); }
     const from = `FROM audit_logs al LEFT JOIN users u ON al.user_id=u.id ${where.length ? 'WHERE ' + where.join(' AND ') : ''}`;
-    const [rows, total, actions, stats] = await Promise.all([
+    const [rows, total, summary] = await Promise.all([
       // Pas d'old_value/new_value ni de user_agent : l'écran n'en a pas besoin
       db.many(`SELECT al.id, al.user_id, al.action, al.entity_type, al.entity_id, al.ip_address, al.created_at,
                       u.first_name||' '||u.last_name AS user_name
                ${from} ORDER BY al.created_at DESC LIMIT ${limit} OFFSET ${offset}`, params),
-      db.one(`SELECT COUNT(*)::int AS n ${from}`, params),
-      db.many(`SELECT DISTINCT action FROM audit_logs ORDER BY action`),
-      db.one(`SELECT COUNT(*)::int AS total,
-                COUNT(*) FILTER (WHERE action='LOGIN')::int AS logins,
-                COUNT(*) FILTER (WHERE action='CREATE_REQUEST')::int AS created,
-                COUNT(*) FILTER (WHERE action='APPROVED_REQUEST')::int AS approved
-              FROM audit_logs`),
+      // Sans filtre, le total est celui du résumé (évite un second comptage complet)
+      where.length ? db.one(`SELECT COUNT(*)::int AS n ${from}`, params) : null,
+      getAuditSummary(),
     ]);
-    res.json({ rows, total: total.n, page: offset / limit + 1, limit, actions: actions.map(a => a.action), stats });
+    res.json({ rows, total: total ? total.n : summary.stats.total, page: offset / limit + 1, limit, ...summary });
   } catch (err) { console.error(err); res.status(500).json({ error: 'Erreur serveur' }); }
 });
 
@@ -1839,8 +1858,9 @@ async function checkLicenseOnStartup() {
 }
 
 // ── DÉMARRAGE ────────────────────────────────────────────────
-// require('./app') (tâche planifiée, tests) ne démarre pas de serveur
-if (require.main === module) app.listen(config.port, () => {
+// require('./app') (tâche planifiée, tests) ne démarre pas de serveur ;
+// cluster.js appelle startServer() dans chaque processus
+function startServer() { return app.listen(config.port, () => {
   console.log(`\n⟡ EcoGec API démarrée`);
   console.log(`  → http://localhost:${config.port}`);
   console.log(`  → Health: http://localhost:${config.port}/health\n`);
@@ -1856,6 +1876,7 @@ if (require.main === module) app.listen(config.port, () => {
     setTimeout(reminders, 10 * 1000);
     setInterval(reminders, 60 * 60 * 1000);
   }
-});
+}); }
+if (require.main === module) startServer();
 
-module.exports = { app, pool, runReturnReminders };
+module.exports = { app, pool, runReturnReminders, startServer };
