@@ -18,6 +18,7 @@ const useAuthStore = create((set) => ({
         localStorage.setItem('accessToken', accessToken);
         localStorage.setItem('refreshToken', refreshToken);
         localStorage.setItem('user', JSON.stringify(user));
+        localStorage.setItem('ecogec:last-activity', String(Date.now()));  // départ du délai d'inactivité
         set({ user, loading: false });
         return { ok: true };
       })

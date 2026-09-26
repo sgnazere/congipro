@@ -108,6 +108,35 @@ export default function Users() {
   }
 
   const [editing, setEditing] = useState<any | null>(null)
+  const [pwdFor,  setPwdFor]  = useState<any | null>(null)
+  const [pwd,     setPwd]     = useState({ value: '', confirm: '', show: false })
+
+  // RH : tout compte sauf super administrateur ; super administrateur : tous, y compris le sien
+  const canSetPassword = (u: any) => me?.role === 'admin' || u.role !== 'admin'
+
+  const generatePassword = () => {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789'
+    const rnd = crypto.getRandomValues(new Uint32Array(11))
+    const v = Array.from(rnd, n => chars[n % chars.length]).join('') + (rnd[0] % 10)
+    setPwd({ value: v, confirm: v, show: true })
+  }
+
+  const handlePassword = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!pwdFor) return
+    if (pwd.value !== pwd.confirm) { setFormMsg('Les deux saisies ne correspondent pas.'); return }
+    setSaving(true); setFormMsg(null)
+    try {
+      await api.patch(`/users/${pwdFor.id}/password`, { password: pwd.value })
+      const self = pwdFor.id === me?.id
+      setMsg({ type: 'success', text: self
+        ? '✅ Votre mot de passe a été modifié.'
+        : `✅ Mot de passe de ${pwdFor.first_name} ${pwdFor.last_name} modifié : ses sessions ouvertes sont fermées. Communiquez-lui le nouveau mot de passe par un canal sûr.` })
+      setPwdFor(null)
+    } catch (err: any) {
+      setFormMsg(err.response?.data?.error || 'Erreur serveur')
+    } finally { setSaving(false) }
+  }
 
   const handleEdit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -236,6 +265,9 @@ export default function Users() {
                     <button className="btn btn-sm btn-outline" disabled={locked} style={{ marginRight: 4 }}
                       title={locked ? 'Réservé au super administrateur' : 'Modifier nom, email, rôle, projet'}
                       onClick={() => { setEditing({ ...u }); setFormMsg(null) }}>✎</button>
+                    <button className="btn btn-sm btn-outline" disabled={!canSetPassword(u)} style={{ marginRight: 4 }}
+                      title={canSetPassword(u) ? 'Définir un nouveau mot de passe' : 'Réservé au super administrateur'}
+                      onClick={() => { setPwdFor(u); setPwd({ value: '', confirm: '', show: false }); setFormMsg(null) }}>🔑</button>
                     {u.id === me?.id ? <span className="form-hint">Vous</span> : (
                       <button className={`btn btn-sm ${u.is_active ? 'btn-outline' : 'btn-green'}`}
                         disabled={locked} title={locked ? 'Réservé au super administrateur' : ''}
@@ -251,6 +283,46 @@ export default function Users() {
         </table>
         <Pager page={page} total={total} limit={PAGE_SIZE} onPage={setPage} />
       </div>
+
+      {pwdFor && (
+        <div className="modal-backdrop" onClick={e => { if (e.target === e.currentTarget) setPwdFor(null) }}>
+          <div className="card" style={{ width: '100%', maxWidth: 440 }}>
+            <div style={{ fontWeight: 700, fontSize: '1.1rem', color: 'var(--navy)', marginBottom: '1rem' }}>🔑 Nouveau mot de passe</div>
+            <div className="alert alert-info">
+              <div>
+                <strong>{pwdFor.first_name} {pwdFor.last_name}</strong> — {pwdFor.email}
+                <div style={{ fontSize: '.78rem', marginTop: 4 }}>
+                  {pwdFor.id === me?.id ? 'Vous modifiez votre propre mot de passe.'
+                    : 'Ses sessions ouvertes seront fermées et une notification l’informera du changement.'}
+                </div>
+              </div>
+            </div>
+            {formMsg && <div className="alert alert-danger">❌ {formMsg}</div>}
+            <form onSubmit={handlePassword}>
+              <div className="form-group">
+                <label className="form-label">Nouveau mot de passe *</label>
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <input className="form-control" type={pwd.show ? 'text' : 'password'} value={pwd.value} autoComplete="new-password" required
+                    onChange={e => setPwd({ ...pwd, value: e.target.value })} />
+                  <button type="button" className="btn btn-sm btn-outline" onClick={() => setPwd({ ...pwd, show: !pwd.show })}
+                    title={pwd.show ? 'Masquer' : 'Afficher'}>{pwd.show ? '🙈' : '👁'}</button>
+                  <button type="button" className="btn btn-sm btn-outline" onClick={generatePassword} title="Générer un mot de passe aléatoire">🎲</button>
+                </div>
+                <div className="form-hint">8 caractères minimum, dont au moins une lettre et un chiffre.</div>
+              </div>
+              <div className="form-group">
+                <label className="form-label">Confirmation *</label>
+                <input className="form-control" type={pwd.show ? 'text' : 'password'} value={pwd.confirm} autoComplete="new-password" required
+                  onChange={e => setPwd({ ...pwd, confirm: e.target.value })} />
+              </div>
+              <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+                <button type="button" className="btn btn-outline" onClick={() => setPwdFor(null)}>Annuler</button>
+                <button type="submit" className="btn btn-navy" disabled={saving}>{saving ? 'Enregistrement…' : 'Enregistrer'}</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
 
       {editing && (
         <div className="modal-backdrop" onClick={e => { if (e.target === e.currentTarget) setEditing(null) }}>

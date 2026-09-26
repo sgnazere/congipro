@@ -3,6 +3,7 @@ import { useNavigate, useLocation } from 'react-router-dom'
 import api from '../api/axios'
 import useAuthStore from '../store/authStore'
 import { MENUS, ROLE_LABELS, PAGE_TITLES, COUNTERS_EVENT, type Role } from '../navigation'
+import IdleLogout from './IdleLogout'
 
 export default function Layout({ children }: { children: React.ReactNode }) {
   const { user, logout } = useAuthStore()
@@ -47,6 +48,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
 
   return (
     <div className="layout">
+      <IdleLogout />
       {/* Sidebar */}
       <div className="sidebar">
         <div className="sidebar-logo">

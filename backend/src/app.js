@@ -90,7 +90,9 @@ async function audit(userId, action, entityType, entityId, oldVal, newVal, req) 
 // JWT tokens
 const makeTokens = (user) => ({
   accessToken:  jwt.sign({ id: user.id, role: user.role, email: user.email }, config.jwtSecret, { expiresIn: config.jwtExpiry }),
-  refreshToken: jwt.sign({ id: user.id }, config.jwtRefresh, { expiresIn: config.jwtRefreshExp }),
+  // jwtid unique : sans lui, deux jetons émis la même seconde étaient identiques (un jeton révoqué
+  // pouvait redevenir valide après une nouvelle connexion)
+  refreshToken: jwt.sign({ id: user.id }, config.jwtRefresh, { expiresIn: config.jwtRefreshExp, jwtid: crypto.randomUUID() }),
 });
 
 // Calcul jours ouvrés (lundi→vendredi, hors fériés)
@@ -529,6 +531,42 @@ const profileSchema = z.object({
   hire_date:  z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
 });
 const PROFILE_FIELDS = Object.keys(profileSchema.shape);
+
+// PATCH /api/users/:id/password — nouveau mot de passe défini par les RH ou le super administrateur
+//  RH    : tout compte sauf un super administrateur (y compris le sien)
+//  admin : tout compte, y compris le sien
+const passwordSchema = z.object({
+  password: z.string().min(8, 'Le mot de passe doit contenir au moins 8 caractères').max(128)
+    .regex(/[A-Za-z]/, 'Le mot de passe doit contenir au moins une lettre')
+    .regex(/[0-9]/, 'Le mot de passe doit contenir au moins un chiffre'),
+});
+
+app.patch('/api/users/:id/password', authenticate, authorize('rh', 'admin'), async (req, res) => {
+  try {
+    const parsed = passwordSchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Mot de passe invalide' });
+    const target = await db.one('SELECT id, role, first_name, last_name FROM users WHERE id=$1', [req.params.id]);
+    if (!target) return res.status(404).json({ error: 'Utilisateur introuvable' });
+    if (target.role === 'admin' && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Seul un super administrateur peut modifier ce mot de passe' });
+    }
+    const self = target.id === req.user.id;
+    const hash = await bcrypt.hash(parsed.data.password, config.bcryptRounds);
+    // Les sessions de la personne sont fermées (sauf si elle change son propre mot de passe)
+    await db.run(
+      `UPDATE users SET password_hash=$1, refresh_token = CASE WHEN $3 THEN refresh_token END, updated_at=NOW() WHERE id=$2`,
+      [hash, target.id, self]
+    );
+    if (!self) {
+      const by = await db.one('SELECT first_name, last_name FROM users WHERE id=$1', [req.user.id]);
+      await notify(target.id, 'system', 'Mot de passe modifié',
+        `Votre mot de passe a été modifié par ${by.first_name} ${by.last_name}. Utilisez le nouveau mot de passe qui vous a été communiqué.`, null);
+    }
+    // Jamais le mot de passe ni son empreinte dans le journal
+    await audit(req.user.id, 'RESET_PASSWORD', 'user', target.id, null, { self }, req);
+    res.json({ ok: true, sessions_revoked: !self });
+  } catch (err) { console.error(err); res.status(500).json({ error: 'Erreur serveur' }); }
+});
 
 app.patch('/api/users/:id', authenticate, authorize('rh', 'admin'), async (req, res) => {
   try {
@@ -1252,7 +1290,7 @@ async function runReturnReminders() {
   const lock = await pool.connect();
   try {
     const { rows: [l] } = await lock.query('SELECT pg_try_advisory_lock(8110) AS ok');
-    if (!l.ok) return 0;
+    if (!l.ok) return null;   // un autre passage est en cours
     try { return await sendReturnReminders(); }
     finally { await lock.query('SELECT pg_advisory_unlock(8110)'); }
   } finally { lock.release(); }
@@ -1306,6 +1344,7 @@ async function sendReturnReminders() {
 app.post('/api/returns/run-reminders', authenticate, authorize('rh', 'admin'), async (req, res) => {
   try {
     const sent = await runReturnReminders();
+    if (sent === null) return res.status(409).json({ error: 'Un passage de relances est déjà en cours, réessayez dans un instant.' });
     res.json({ ok: true, message: `${sent} relance(s) envoyée(s).` });
   } catch (err) {
     console.error(err);

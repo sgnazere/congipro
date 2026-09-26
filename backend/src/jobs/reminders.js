@@ -8,6 +8,6 @@
 const { runReturnReminders, pool } = require('../app');
 
 runReturnReminders()
-  .then(n => console.log(`${new Date().toISOString()} — ${n} relance(s) de retour envoyée(s)`))
+  .then(n => console.log(`${new Date().toISOString()} — ` + (n === null ? 'passage déjà en cours ailleurs, rien à faire' : `${n} relance(s) de retour envoyée(s)`)))
   .catch(err => { console.error('Relances retour :', err.message); process.exitCode = 1; })
   .finally(() => pool.end());

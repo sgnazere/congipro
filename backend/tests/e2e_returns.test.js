@@ -92,6 +92,8 @@ const bal = async (tok, code) => { const b = (await call(tok, 'GET', '/balances/
   console.log('— Relances (1 niveau 24-25/08 approuvé, jamais déclaré)');
   const e = await approved('TESTN1', '2026-08-24', '2026-08-25', 'Test relance');
   x = await call(rh, 'POST', '/returns/run-reminders');
+  // Passage automatique de l'API en cours : on réessaie
+  for (let i = 0; i < 5 && x.status === 409; i++) { await new Promise(r => setTimeout(r, 2000)); x = await call(rh, 'POST', '/returns/run-reminders'); }
   check('Relances envoyées', x.status === 200 && /[1-9]/.test(x.data.message), x);
   check('Employé relancé', (await call(E, 'GET', '/notifications')).data.some(n => n.request_id === e.id && n.type === 'reminder'));
   check('Manager relancé', (await call(M, 'GET', '/notifications')).data.some(n => n.request_id === e.id && n.type === 'reminder'));

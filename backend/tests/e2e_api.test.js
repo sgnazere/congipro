@@ -165,6 +165,24 @@ const bal = async (tok, code) => {
   check('RH ne peut pas promouvoir super admin (403)', (await call(rh, 'PATCH', `/users/${emp.id}`, { role: 'admin' })).status === 403);
   check('Email invalide refusé (400)', (await call(rh, 'PATCH', `/users/${emp.id}`, { email: 'pas-un-email' })).status === 400);
 
+  console.log('— Changement de mot de passe par les RH');
+  const refreshE = (await call(null, 'POST', '/auth/login', { email: 'test-audit.employe2@ecogec.test', password: pw })).data.refreshToken;
+  x = await call(rh, 'PATCH', `/users/${emp.id}/password`, { password: 'court1' });
+  check('Mot de passe trop faible refusé (400)', x.status === 400, x);
+  x = await call(rh, 'PATCH', `/users/${emp.id}/password`, { password: 'NouveauMdp2026' });
+  check('RH change le mot de passe d’un employé', x.status === 200 && x.data.sessions_revoked === true, x);
+  // Avant toute nouvelle connexion (un jeton émis la même seconde serait identique)
+  check('Anciennes sessions fermées (refresh refusé)', (await call(null, 'POST', '/auth/refresh', { refreshToken: refreshE })).status === 401);
+  check('Connexion avec le nouveau mot de passe', !!(await login('test-audit.employe2@ecogec.test', 'NouveauMdp2026')));
+  check('Ancien mot de passe refusé (401)', (await call(null, 'POST', '/auth/login', { email: 'test-audit.employe2@ecogec.test', password: pw })).status === 401);
+  check('Employé notifié du changement', (await call(await login('test-audit.employe2@ecogec.test', 'NouveauMdp2026'), 'GET', '/notifications')).data.some(n => n.title === 'Mot de passe modifié'));
+  const superAdmin = (await call(rh, 'GET', '/users?roles=admin')).data[0];
+  if (superAdmin) check('RH ne peut pas changer le mot de passe du super administrateur (403)',
+    (await call(rh, 'PATCH', `/users/${superAdmin.id}/password`, { password: 'Tentative2026' })).status === 403);
+  check('Un manager ne peut pas changer de mot de passe (403)', (await call(M, 'PATCH', `/users/${emp.id}/password`, { password: 'Tentative2026' })).status === 403);
+  const audits = (await call(rh, 'GET', '/audit-logs?action=RESET_PASSWORD&limit=10')).data.rows;
+  check('Changement tracé dans l’audit, sans le mot de passe', audits.length >= 1 && !JSON.stringify(audits).includes('NouveauMdp2026'));
+
   console.log(`\n${pass} réussis, ${fail} échoués`);
   process.exitCode = fail ? 1 : 0;
 })().catch(e => { console.error(e); process.exitCode = 1; });
