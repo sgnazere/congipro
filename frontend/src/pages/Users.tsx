@@ -141,14 +141,19 @@ export default function Users() {
   const handleEdit = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!editing) return
+    const newPwd = editing.new_password || ''
+    if (newPwd && newPwd !== editing.new_password_confirm) { setFormMsg('Les deux saisies du mot de passe ne correspondent pas.'); return }
     setSaving(true); setFormMsg(null)
     try {
+      // Mot de passe d'abord : s'il est refusé (trop faible), rien n'est modifié
+      if (newPwd) await api.patch(`/users/${editing.id}/password`, { password: newPwd })
       await api.patch(`/users/${editing.id}`, {
         first_name: editing.first_name.trim(), last_name: editing.last_name.trim(), email: editing.email.trim(),
         role: editing.role, project_id: editing.project_id || null,
         ...(editing.hire_date ? { hire_date: editing.hire_date.slice(0, 10) } : {}),
       })
-      setMsg({ type: 'success', text: `✅ Compte de ${editing.first_name} ${editing.last_name} mis à jour.` })
+      setMsg({ type: 'success', text: `✅ Compte de ${editing.first_name} ${editing.last_name} mis à jour.`
+        + (newPwd && editing.id !== me?.id ? ' Nouveau mot de passe enregistré : ses sessions sont fermées, communiquez-le-lui par un canal sûr.' : newPwd ? ' Votre mot de passe a été modifié.' : '') })
       setEditing(null)
       load()
     } catch (err: any) {
@@ -264,10 +269,10 @@ export default function Users() {
                   <td style={{ whiteSpace: 'nowrap' }}>
                     <button className="btn btn-sm btn-outline" disabled={locked} style={{ marginRight: 4 }}
                       title={locked ? 'Réservé au super administrateur' : 'Modifier nom, email, rôle, projet'}
-                      onClick={() => { setEditing({ ...u }); setFormMsg(null) }}>✎</button>
+                      onClick={() => { setEditing({ ...u }); setFormMsg(null) }}>✎ Modifier</button>
                     <button className="btn btn-sm btn-outline" disabled={!canSetPassword(u)} style={{ marginRight: 4 }}
                       title={canSetPassword(u) ? 'Définir un nouveau mot de passe' : 'Réservé au super administrateur'}
-                      onClick={() => { setPwdFor(u); setPwd({ value: '', confirm: '', show: false }); setFormMsg(null) }}>🔑</button>
+                      onClick={() => { setPwdFor(u); setPwd({ value: '', confirm: '', show: false }); setFormMsg(null) }}>🔑 Mot de passe</button>
                     {u.id === me?.id ? <span className="form-hint">Vous</span> : (
                       <button className={`btn btn-sm ${u.is_active ? 'btn-outline' : 'btn-green'}`}
                         disabled={locked} title={locked ? 'Réservé au super administrateur' : ''}
@@ -374,6 +379,29 @@ export default function Users() {
                 <input className="form-control" type="date" value={editing.hire_date?.slice(0, 10) || ''}
                   onChange={e => setEditing({ ...editing, hire_date: e.target.value })} />
               </div>
+              {canSetPassword(editing) && (
+                <div style={{ borderTop: '1px solid var(--border)', paddingTop: '1rem', marginTop: '.5rem' }}>
+                  <div className="card-title" style={{ marginBottom: '.5rem' }}>🔑 Mot de passe</div>
+                  <div className="form-row">
+                    <div className="form-group">
+                      <label className="form-label">Nouveau mot de passe</label>
+                      <input className="form-control" type="password" autoComplete="new-password" value={editing.new_password || ''}
+                        placeholder="Laisser vide pour ne pas changer"
+                        onChange={e => setEditing({ ...editing, new_password: e.target.value })} />
+                    </div>
+                    <div className="form-group">
+                      <label className="form-label">Confirmation</label>
+                      <input className="form-control" type="password" autoComplete="new-password" value={editing.new_password_confirm || ''}
+                        disabled={!editing.new_password}
+                        onChange={e => setEditing({ ...editing, new_password_confirm: e.target.value })} />
+                    </div>
+                  </div>
+                  <div className="form-hint" style={{ marginTop: -8 }}>
+                    8 caractères minimum, dont une lettre et un chiffre.
+                    {editing.id !== me?.id && ' Les sessions ouvertes de la personne seront fermées.'}
+                  </div>
+                </div>
+              )}
               <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: '1rem' }}>
                 <button type="button" className="btn btn-outline" onClick={() => setEditing(null)}>Annuler</button>
                 <button type="submit" className="btn btn-navy" disabled={saving}>{saving ? 'Enregistrement...' : 'Enregistrer'}</button>
