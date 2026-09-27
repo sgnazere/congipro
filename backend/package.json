@@ -9,6 +9,7 @@
     "start:cluster": "node src/cluster.js",
     "dev": "nodemon src/app.js",
     "db:migrate": "node src/db/migrate.js",
+    "db:init": "node src/db/init.js",
     "job:reminders": "node src/jobs/reminders.js",
     "test:e2e:circuit": "node tests/e2e_api.test.js",
     "test:e2e:retours": "node tests/e2e_returns.test.js"

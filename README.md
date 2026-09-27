@@ -20,15 +20,15 @@ Application web de demande, validation et suivi des congés (projet « Congipro 
 ## Installation (développement)
 
 ```bash
-# Base de données
+# Base de données (vide)
 createdb congipro
-psql -d congipro -f backend/src/db/schema.sql
 
 # API
 cd backend
 cp .env.example .env        # puis renseigner DB_*, JWT_*, LICENSE_MASTER_KEY
 npm ci
-npm run db:migrate
+npm run db:init -- --admin-email prenom.nom@exemple.org --admin-first Prénom --admin-last NOM \
+                   --license-file ../licenses/licence.json
 npm run dev                 # http://localhost:3001
 
 # Interface
@@ -40,6 +40,7 @@ npm run dev                 # http://localhost:5173 (proxy /api → 3001)
 
 ## Base de données
 
+- `npm run db:init` : installation complète et relançable — schéma de référence si la base est vide, migrations, types de congé, jours fériés de Côte d'Ivoire (année en cours et suivante, `--holidays 2028`), premier super administrateur (mot de passe généré et affiché une seule fois si `--admin-password` est absent), licence (`--license-file` ou `--license-key`). `npm run db:init -- --help` pour le détail.
 - `backend/src/db/schema.sql` : schéma de référence
 - `backend/src/db/migrations/NNN_*.sql` : évolutions, appliquées dans l'ordre par `npm run db:migrate` (suivi dans la table `schema_migrations`)
 - Contrôle de cohérence des soldes : vue `v_balance_check`, recalcul par `SELECT recompute_balances();`
